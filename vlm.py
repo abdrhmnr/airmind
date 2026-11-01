@@ -12,7 +12,9 @@ import urllib.request
 VISION_HINTS = ("vl", "vision", "llava", "gemma3", "gemma-3", "minicpm-v", "moondream", "pixtral",
                 "bakllava", "llama3.2-vision", "granite3.2-vision", "mistral-small3", "internvl", "phi-3.5-vision",
                 "phi-4-multimodal", "smolvlm", "gemma4", "gemma-4")
-PREFERRED = ("qwen3-vl", "qwen2.5vl", "qwen2.5-vl", "gemma3", "gemma-3", "minicpm-v", "llama3.2-vision", "llava")
+# instruct models answer at once; "thinking" ones (Ollama's plain qwen3-vl:4b / :2b ARE the thinking
+# versions) write a long hidden essay first: slow, and short answers come back empty
+PREFERRED = ("qwen3-vl:4b-instruct", "qwen3-vl:2b-instruct", "qwen3-vl:8b-instruct", "qwen2.5vl", "qwen3-vl", "qwen2.5vl", "qwen2.5-vl", "gemma3", "gemma-3", "minicpm-v", "llama3.2-vision", "llava")
 
 
 def http_json(url, payload=None, timeout=5):
@@ -46,6 +48,9 @@ def discover_models():
 
 def pick_model(found, wanted=None):
     if wanted:
+        exact = [f for f in found if f[2].lower() == wanted.lower()]
+        if exact:
+            return exact[0]
         for f in found:
             if wanted.lower() in f[2].lower():
                 return f
@@ -229,11 +234,19 @@ class LocalVLM:
                 body["format"] = "json"
                 body.pop("think", None)
                 r = http_json(f"{self.url}/api/chat", body, timeout=120)
-            content = (r.get("message") or {}).get("content") or ""
+            msg = r.get("message") or {}
+            content = msg.get("content") or ""
+            if not content.strip() and msg.get("thinking"):
+                # a "thinking" model ignored think=false and spent every token thinking: let it finish this time
+                if not getattr(self, "_think_warned", False):
+                    self._think_warned = True
+                    print(f"[model] {self.model} is a THINKING model: slow, and it ignores think=false.\n"
+                          f"        Faster:  ollama pull qwen3-vl:4b-instruct   then restart start.sh", flush=True)
+                body["options"]["num_predict"] = max_tokens + 3000
+                r = http_json(f"{self.url}/api/chat", body, timeout=240)
+                content = (r.get("message") or {}).get("content") or ""
             if not content.strip():
-                # thinking models (qwen3-vl) can spend every token on "thinking" and return an empty answer
-                print(f"[model] empty answer (done_reason={r.get('done_reason')}, "
-                      f"thinking={len((r.get('message') or {}).get('thinking') or '')} chars)", flush=True)
+                print(f"[model] empty answer (done_reason={r.get('done_reason')})", flush=True)
             return content
 
         msgs = [{"role": "system", "content": system}]

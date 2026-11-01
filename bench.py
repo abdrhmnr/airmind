@@ -9,7 +9,7 @@ Which vision model is best for YOUR room? Measure it instead of guessing.
    You can also drop your own photos into bench/ and add a line "file,word" for each.
 
 2) Run the models you have (Ollama names, or any part of a name from `python airmind.py --list`):
-     python bench.py run qwen2.5vl:3b qwen3-vl:2b qwen3-vl:4b
+     python bench.py run qwen2.5vl:3b qwen3-vl:2b-instruct qwen3-vl:4b-instruct
 
    For each model: top-1 accuracy (the word the app would show), top-3 (the right word is among the
    1/2/3 choices), how often the answer is a real dictionary word, and seconds per photo.
@@ -129,4 +129,4 @@ if __name__ == "__main__":
     elif sys.argv[1] == "make":
         make()
     else:
-        run(sys.argv[2:] or ["qwen2.5vl:3b", "qwen3-vl:2b", "qwen3-vl:4b"])
+        run(sys.argv[2:] or ["qwen2.5vl:3b", "qwen3-vl:2b-instruct", "qwen3-vl:4b-instruct"])

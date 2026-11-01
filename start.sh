@@ -28,7 +28,7 @@ fi
 # 2) start the model. Two choices:
 #    - default: Gemma 4 26B through llama-server (big, smart, slower on 24 GB)
 #    - FAST=1:  a small vision model through Ollama (much faster; download once with
-#               `ollama pull qwen3-vl:4b` or `ollama pull qwen3-vl:2b`). Pick one with OLLAMA_MODEL=name
+#               `ollama pull qwen3-vl:4b-instruct` (NOT plain qwen3-vl:4b: that one is the slow "thinking" version)). Pick one with OLLAMA_MODEL=name
 SERVER_PID=""
 APP_ARGS=()
 if [ -n "$FAST" ] || [ -n "$OLLAMA_MODEL" ]; then
@@ -40,8 +40,8 @@ if [ -n "$FAST" ] || [ -n "$OLLAMA_MODEL" ]; then
     until curl -s http://127.0.0.1:11434/api/tags >/dev/null; do sleep 1; done
   fi
   if [ -z "$OLLAMA_MODEL" ]; then            # the best small vision model you have downloaded
-    for m in qwen3-vl:4b qwen3-vl:2b qwen2.5vl:3b; do
-      if ollama list | grep -q "^$m"; then OLLAMA_MODEL=$m; break; fi
+    for m in qwen3-vl:4b-instruct qwen3-vl:2b-instruct qwen2.5vl:3b qwen3-vl:4b qwen3-vl:2b; do
+      if ollama list | grep -q "^$m "; then OLLAMA_MODEL=$m; break; fi
     done
     OLLAMA_MODEL="${OLLAMA_MODEL:-qwen2.5vl:3b}"
   fi
