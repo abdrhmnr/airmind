@@ -1,29 +1,27 @@
 #!/usr/bin/env python3
 """
-AirMind: draw in the air with your finger, a vision model running on your Mac
-looks at the camera frame + your drawing and answers out loud.
+AirMind: draw in the air with your finger, a vision model running on your Mac looks at the camera
+and answers out loud. Built around learning Chinese from the real objects around you.
 
-  pinch (thumb + index)  -> draw
-  thumbs up (hold)       -> ask the AI      (or SPACE)
-  fist (hold)            -> clear           (or C)
-  V key                  -> talk to it: ask any question out loud
+  pinch (thumb + index)  -> draw              thumbs up (hold) -> ask        fist (hold) -> clear
+  hold an object still in the red box (AUTO on) -> it asks by itself
+  point at an object in INSTANT mode -> hear its Chinese name
 
-  Circle a real object  -> it tells you what it is
-  Write math            -> it solves it (verified with SymPy)
-  Sketch something      -> it guesses
-  Write a word          -> it reads + translates
+Modes
+  T  learn words: 中文 -> EN -> off      word card with dictionary-checked pinyin, tones, 量词, HSK
+  O  read text (menus, labels, signs) + halal check of ingredients
+  H  "find it" review game from your notebook
+  I  instant labels on everything (needs: pip install ultralytics)
 
-Fully local + free: MediaPipe for hands, Ollama or LM Studio for the vision model,
-macOS `say` for the voice.
-
-Keys: P say it again | Z ask zone right/left/off | G shape snapping on/off | T learn mode (中文 / EN / off) | K ink color | X remove stickers
+Keys: 1/2/3 pick another candidate | Y say it (pronunciation check) | N notebook -> Anki | A auto-ask
+      P say again | Z red box right/left/off | G shape snapping | K ink | X remove stickers
       V talk | SPACE ask | C clear | L arabic/english | F full screen | R record | S photo | M mute | Q quit
+
+Everything runs locally: MediaPipe (hands), Ollama / LM Studio / llama-server (vision model),
+CC-CEDICT + pypinyin (Chinese facts), SymPy (math), faster-whisper (speech), macOS `say` + Vision OCR.
 """
 import argparse
-import base64
 import queue
-import json
-import re
 import shutil
 import ssl
 import subprocess
@@ -33,17 +31,26 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from functools import lru_cache
 from pathlib import Path
 
 import cv2
-import mediapipe as mp
 import numpy as np
-from mediapipe.tasks import python as mpt
-from mediapipe.tasks.python import vision
 
-VERSION = "2026-10-31 draw-first"
-W, H = 720, 1280
+import chinese
+import ocr
+import ui
+from audio import Listener, SpeechToText
+from capture import AutoCapture, FrameBuffer
+from detector import InstantDetector
+from hands import OneEuro, pick_hands, read_hand, snap_shape, stroke_points
+from tracker import StickerBoard
+from ui import ACCENT, Text, blit, round_rect, render_card, render_sticker
+from vlm import (LocalVLM, discover_models, http_json, is_vision, parse_json, parse_learn, parse_reply,
+                 pick_model)
+from vocab import Vocab
+
+VERSION = "2026-11-01 learn-pro"
+W, H = 1280, 720
 HERE = Path(__file__).resolve().parent
 MODEL_DIR = HERE / "models"
 OUT_DIR = HERE / "captures"
@@ -51,205 +58,47 @@ HAND_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand
 
 INKS = [("blue", (255, 120, 10)), ("red", (40, 40, 235)), ("yellow", (0, 210, 255)), ("white", (250, 250, 250))]
 INK_SHADOW = (25, 25, 25)
-ACCENT = (255, 196, 92)          # soft blue (BGR)
 SEND_INK = (255, 0, 255)         # strokes are magenta in the image the model sees
-
-VISION_HINTS = ("vl", "vision", "llava", "gemma3", "gemma-3", "minicpm-v", "moondream", "pixtral",
-                "bakllava", "llama3.2-vision", "granite3.2-vision", "mistral-small3", "internvl", "phi-3.5-vision",
-                "phi-4-multimodal", "smolvlm", "gemma4", "gemma-4")
-PREFERRED = ("qwen3-vl", "qwen2.5vl", "qwen2.5-vl", "gemma3", "gemma-3", "minicpm-v", "llama3.2-vision", "llava")
-
-SYSTEM = {
-    "ar": """You are AirMind, a sharp and funny assistant that sees through a webcam.
-The user draws in the air with a finger; the strokes are overlaid on the image in bright MAGENTA.
-Decide what the magenta strokes are and reply:
-- "object": the strokes circle, underline or point at a real thing in the scene. Name the thing precisely (brand/type if visible) and add one short interesting fact.
-- "math": handwritten math. Copy it exactly into "math_expr" using Python/SymPy syntax (use * and **, use = for equations, x as the variable).
-- "drawing": a sketch. Guess what it depicts, playfully.
-- "text": a handwritten word or short phrase. Read it and translate it (Arabic<->English).
-- "scene": there are no strokes. Say something fun about what you see.
-- "answer": the user asked you a question out loud. Answer it directly using what you see (up to 3 short sentences).
-Reply with JSON only: {"kind": "...", "say": "...", "math_expr": ""}
-"say" MUST be in Egyptian Arabic dialect, at most 2 short sentences, natural, witty, no emojis.""",
-    "en": """You are AirMind, a sharp and funny assistant that sees through a webcam.
-The user draws in the air with a finger; the strokes are overlaid on the image in bright MAGENTA.
-Decide what the magenta strokes are and reply:
-- "object": the strokes circle, underline or point at a real thing in the scene. Name it precisely and add one short interesting fact.
-- "math": handwritten math. Copy it exactly into "math_expr" using Python/SymPy syntax (use * and **, use = for equations, x as the variable).
-- "drawing": a sketch. Guess what it depicts, playfully.
-- "text": a handwritten word or short phrase. Read it and translate it to Arabic.
-- "scene": there are no strokes. Say something fun about what you see.
-- "answer": the user asked you a question out loud. Answer it directly using what you see (up to 3 short sentences).
-Reply with JSON only: {"kind": "...", "say": "...", "math_expr": ""}
-"say" must be in English, at most 2 short sentences, witty, no emojis.""",
-}
-
-LEARN_LANGS = {"zh": "Simplified Chinese (Mandarin)", "en": "English"}
-LEARN_TAG = {"zh": "中文", "en": "EN"}
-LEARN_SYSTEM = """You are a friendly vocabulary tutor that sees through a webcam.
-The user circled something with bright MAGENTA strokes. If there are no strokes, pick the most prominent
-object in front of the camera (not the person, unless they clearly point at a body part or clothing).
-Identify the object precisely and teach its name in {lang}.
-Reply with JSON only:
-{{"word": "<the name in {lang}{zh_note}>", "pron": "<{pron_note}>", "en": "<English name>", "ar": "<Arabic name>",
-"example": "<a very short, natural example sentence in {lang} using the word>"}}"""
-
-
-def learn_prompt(target):
-    if target == "zh":
-        return LEARN_SYSTEM.format(lang=LEARN_LANGS[target], zh_note=", simplified characters",
-                                   pron_note="pinyin with tone marks, e.g. bēizi")
-    return LEARN_SYSTEM.format(lang=LEARN_LANGS[target], zh_note="",
-                               pron_note="simple pronunciation guide split into syllables, e.g. KUP or LAP-top")
-
+MIN_STROKE = 30                  # px: smaller "strokes" are just fingers holding something
+CONTEXT_SECONDS = 90             # a question within this time is a follow-up about the same picture
 
 KIND_LABEL = {
-    "ar": {"object": "شايفها", "math": "مسألة", "drawing": "رسمة", "text": "كلمة", "scene": "الكادر", "answer": "سؤالك", "error": "مشكلة"},
-    "en": {"object": "I SEE IT", "math": "MATH", "drawing": "DRAWING", "text": "WORD", "scene": "SCENE", "answer": "YOU ASKED", "error": "ERROR"},
+    "ar": {"object": "شايفها", "math": "مسألة", "drawing": "رسمة", "text": "كلمة", "scene": "الكادر", "answer": "سؤالك",
+           "error": "مشكلة", "info": "تمام"},
+    "en": {"object": "I SEE IT", "math": "MATH", "drawing": "DRAWING", "text": "WORD", "scene": "SCENE",
+           "answer": "YOU ASKED", "error": "ERROR", "info": "OK"},
 }
 UI = {
     "ar": {"thinking": "بيفكر", "hint": "لِم الإبهام والسبابة عشان ترسم   •   لايك = اسأل   •   قبضة = امسح",
-           "ask": "اسأل", "clear": "امسح", "listen": "اتكلم", "answer": "الإجابة", "no_server": "شغّل Ollama أو LM Studio الأول",
-           "listening": "سامعك...", "no_stt": "ثبّت faster-whisper الأول:  pip install faster-whisper",
-           "didnt_hear": "ما سمعتش حاجة، جرّب تاني وقرّب من المايك"},
+           "ask": "اسأل", "clear": "امسح", "listen": "اتكلم", "answer": "الإجابة",
+           "no_server": "شغّل Ollama أو LM Studio الأول",
+           "listening": "سامعك...", "say_it": "قول الكلمة بالصيني...", "no_stt": "ثبّت faster-whisper الأول:  pip install faster-whisper",
+           "didnt_hear": "ما سمعتش حاجة، جرّب تاني وقرّب من المايك",
+           "no_words": "لسه ما اتعلمتش كلمات. اضغط T واعمل دايرة حوالين حاجة الأول",
+           "no_word": "اتعلم كلمة الأول (T)، وبعدين اضغط Y عشان تتمرن على نطقها",
+           "haram": "خلي بالك: المكونات فيها خنزير أو كحول", "doubtful": "انتبه: فيه مكونات مش واضح إنها حلال",
+           "halal": "عليها علامة حلال", "right": "صح", "wrong": "لا، دي"},
     "en": {"thinking": "thinking", "hint": "pinch to draw   •   thumbs up = ask   •   fist = clear",
-           "ask": "ASK", "clear": "CLEAR", "listen": "TALK", "answer": "The answer is", "no_server": "Start Ollama or LM Studio first",
-           "listening": "Listening...", "no_stt": "Install faster-whisper first:  pip install faster-whisper",
-           "didnt_hear": "I didn't catch that. Try again a bit closer to the mic"},
+           "ask": "ASK", "clear": "CLEAR", "listen": "TALK", "answer": "The answer is",
+           "no_server": "Start Ollama or LM Studio first",
+           "listening": "Listening...", "say_it": "Say the word in Chinese...", "no_stt": "Install faster-whisper first:  pip install faster-whisper",
+           "didnt_hear": "I didn't catch that. Try again a bit closer to the mic",
+           "no_words": "No words yet. Press T and circle something first",
+           "no_word": "Learn a word first (T), then press Y to practice saying it",
+           "haram": "Careful: this contains pork or alcohol", "doubtful": "Check this: some ingredients may not be halal",
+           "halal": "It has a halal mark", "right": "Right", "wrong": "No, that's"},
 }
 
 
 # --------------------------------------------------------------------------- running helper programs
 def run_tool(cmd, timeout=None):
-    """subprocess.run that starts the program with posix_spawn instead of fork().
-
-    Forking a busy macOS process (camera + OpenCV window + MediaPipe threads) can freeze the
-    child before it even starts, which is exactly how `say` was "hanging" inside the app while
-    it worked fine from the Terminal. posix_spawn needs: a full path, close_fds=False."""
+    """subprocess.run with posix_spawn instead of fork(): forking this busy camera process can freeze
+    the child on macOS (that's how `say` used to hang). posix_spawn needs a full path + close_fds=False."""
     exe = shutil.which(cmd[0])
     if not exe:
         raise FileNotFoundError(cmd[0])
     return subprocess.run([exe] + cmd[1:], capture_output=True, text=True, timeout=timeout,
                           close_fds=False, stdin=subprocess.DEVNULL)
-
-
-# --------------------------------------------------------------------------- local vision model
-def http_json(url, payload=None, timeout=5):
-    data = json.dumps(payload).encode() if payload is not None else None
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode())
-
-
-def is_vision(name):
-    n = name.lower()
-    return any(h in n for h in VISION_HINTS)
-
-
-def discover_models():
-    """Every model the local servers know about: [(backend, url, name)]."""
-    found = []
-    try:
-        for m in http_json("http://127.0.0.1:11434/api/tags", timeout=2).get("models", []):
-            found.append(("ollama", "http://127.0.0.1:11434", m["name"]))
-    except Exception:
-        pass
-    for port in (1234, 8080):   # LM Studio, llama.cpp llama-server (both OpenAI-compatible)
-        try:
-            for m in http_json(f"http://127.0.0.1:{port}/v1/models", timeout=2).get("data", []):
-                found.append(("lmstudio" if port == 1234 else "llama.cpp", f"http://127.0.0.1:{port}", m["id"]))
-        except Exception:
-            pass
-    return found
-
-
-def pick_model(found, wanted=None):
-    if wanted:
-        for f in found:
-            if wanted.lower() in f[2].lower():
-                return f
-        return None
-    vis = [f for f in found if is_vision(f[2])]
-    for pref in PREFERRED:
-        for f in vis:
-            if pref in f[2].lower():
-                return f
-    return vis[0] if vis else None
-
-
-class LocalVLM:
-    def __init__(self, backend, url, model, lang):
-        self.backend, self.url, self.model, self.lang = backend, url, model, lang
-
-    def warm_up(self):
-        try:
-            if self.backend == "ollama":
-                http_json(f"{self.url}/api/generate", {"model": self.model, "keep_alive": "30m"}, timeout=180)
-        except Exception:
-            pass
-
-    def ask(self, jpeg, has_strokes, question=None, focus=False):
-        what = ("This is a close-up of the object I marked with a magenta line or circle"
-                if has_strokes else "This is a close-up of the object I'm holding up")
-        if focus and question:
-            return self.chat(SYSTEM[self.lang], f'{what}. I asked out loud: "{question}". '
-                             'Answer it about this object. Use kind "answer".', jpeg)
-        if focus:
-            return self.chat(SYSTEM[self.lang], f"{what}. What is it? Name it precisely and add one short fun fact. "
-                             'Use kind "object" (or "math"/"text" if I marked writing).', jpeg)
-        if question:
-            prompt = (f'The user asked out loud: "{question}". Answer it based on what you see'
-                      f'{" (the magenta strokes show what they mean)" if has_strokes else ""}. Use kind "answer".')
-        else:
-            prompt = "What do my magenta strokes mean?" if has_strokes else "No strokes this time. What do you see?"
-        return self.chat(SYSTEM[self.lang], prompt, jpeg)
-
-    def ask_learn(self, jpeg, has_strokes, target, focus=False):
-        if focus:
-            prompt = ("This is a close-up of the object I marked with a magenta line or circle. Teach me its word."
-                      if has_strokes else
-                      "This is a close-up of the object I'm holding up. Teach me its word (ignore hands and fingers).")
-        else:
-            prompt = "Teach me the word for what I circled." if has_strokes else "Teach me the word for the main object you see."
-        return self.chat(learn_prompt(target), prompt, jpeg)
-
-    def chat(self, system, prompt, jpeg):
-        b64 = base64.b64encode(jpeg).decode()
-        if self.backend == "ollama":
-            r = http_json(f"{self.url}/api/chat", {
-                "model": self.model, "stream": False, "format": "json", "keep_alive": "30m",
-                "options": {"temperature": 0.4, "num_predict": 220},
-                "messages": [{"role": "system", "content": system},
-                             {"role": "user", "content": prompt, "images": [b64]}],
-            }, timeout=120)
-            return r["message"]["content"]
-        r = http_json(f"{self.url}/v1/chat/completions", {
-            "model": self.model, "temperature": 0.4, "max_tokens": 220,
-            "chat_template_kwargs": {"enable_thinking": False},
-            "messages": [{"role": "system", "content": system},
-                         {"role": "user", "content": [
-                             {"type": "text", "text": prompt},
-                             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}]}],
-        }, timeout=300)
-        return r["choices"][0]["message"]["content"]
-
-
-def parse_json(raw):
-    m = re.search(r"\{.*\}", raw, re.S)
-    try:
-        return json.loads(m.group(0)) if m else {}
-    except json.JSONDecodeError:
-        return {}
-
-
-def parse_reply(raw):
-    m = re.search(r"\{.*\}", raw, re.S)
-    try:
-        d = json.loads(m.group(0)) if m else {}
-    except json.JSONDecodeError:
-        d = {}
-    say = str(d.get("say", "") if d else raw).strip().strip('"')
-    return str(d.get("kind") or "scene").lower(), say, str(d.get("math_expr") or "").strip()
 
 
 def solve_math(expr):
@@ -282,392 +131,14 @@ def solve_math(expr):
         return None
 
 
-# --------------------------------------------------------------------------- listening (speech to text, local)
-class Listener:
-    """Records from the mic until you stop talking (or press V again)."""
-    RATE = 16000
-
-    def __init__(self):
-        self.active, self.chunks, self.level = False, [], 0.0
-
-    def start(self):
-        import sounddevice as sd
-        self.chunks, self.active, self.level = [], True, 0.0
-        self.t0, self.last_voice, self.floor = time.perf_counter(), None, None
-        self.stream = sd.InputStream(samplerate=self.RATE, channels=1, dtype="float32",
-                                     blocksize=self.RATE // 10, callback=self._cb)
-        self.stream.start()
-
-    def _cb(self, indata, frames, t, status):
-        a = indata[:, 0].copy()
-        self.chunks.append(a)
-        rms = float(np.sqrt(np.mean(a ** 2)))
-        self.level = rms
-        if self.floor is None or len(self.chunks) <= 3:           # first 0.3 s: learn the room noise
-            self.floor = rms if self.floor is None else max(self.floor, rms)
-        elif rms > max(0.012, self.floor * 3):
-            self.last_voice = time.perf_counter()
-
-    def should_stop(self):
-        now = time.perf_counter()
-        if now - self.t0 > 15:
-            return True
-        if self.last_voice:
-            return now - self.last_voice > 1.3                    # you paused: done
-        return now - self.t0 > 6                                   # nothing said
-
-    def stop(self):
-        self.active = False
-        try:
-            self.stream.stop()
-            self.stream.close()
-        except Exception:
-            pass
-        heard = self.last_voice is not None
-        return (np.concatenate(self.chunks) if self.chunks else np.zeros(0, np.float32)), heard
-
-
-class SpeechToText:
-    """faster-whisper on the CPU. `base` is ~145 MB (downloaded once), `small` ~480 MB and better at Arabic."""
-
-    def __init__(self, size):
-        self.size, self.model, self.error, self.started = size, None, None, False
-
-    def ensure_loaded(self):
-        """Loaded on first use only: faster-whisper pulls in PyAV, whose copy of the macOS
-        audio/video libraries clashes with OpenCV's, so we keep it out unless you talk."""
-        if not self.started:
-            self.started = True
-            print("Loading the speech model (first time you press V)...", flush=True)
-            threading.Thread(target=self._load, daemon=True).start()
-
-    def _load(self):
-        try:
-            from faster_whisper import WhisperModel
-            self.model = WhisperModel(self.size, device="cpu", compute_type="int8")
-        except ImportError:
-            self.error = "missing"
-        except Exception as e:
-            self.error = f"{type(e).__name__}: {e}"
-            print("Speech model failed to load:", self.error)
-
-    def transcribe(self, audio):
-        for _ in range(600):                                       # first run may still be downloading
-            if self.model or self.error:
-                break
-            time.sleep(0.1)
-        if not self.model:
-            return None
-        segments, _ = self.model.transcribe(audio, beam_size=1, vad_filter=False,
-                                            condition_on_previous_text=False)
-        return " ".join(seg.text.strip() for seg in segments).strip()
-
-
-# --------------------------------------------------------------------------- text rendering (Arabic aware)
-class Text:
-    AR_FONTS = ["/System/Library/Fonts/GeezaPro.ttc", "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-                "/Library/Fonts/Arial Unicode.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"]
-    CJK_FONTS = ["/System/Library/Fonts/PingFang.ttc", "/System/Library/Fonts/Hiragino Sans GB.ttc",
-                 "/System/Library/Fonts/STHeiti Medium.ttc", "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-                 "/Library/Fonts/Arial Unicode.ttf", "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc"]
-    LATIN_FONTS = ["/System/Library/Fonts/HelveticaNeue.ttc", "/System/Library/Fonts/Helvetica.ttc",
-                   "/System/Library/Fonts/Supplemental/Arial.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"]
-
-    def __init__(self):
-        from PIL import ImageFont
-        self.ImageFont = ImageFont
-        first = lambda fs: next((f for f in fs if Path(f).exists()), None)
-        self.paths = {"ar": first(self.AR_FONTS), "cjk": first(self.CJK_FONTS), "latin": first(self.LATIN_FONTS)}
-        try:
-            import arabic_reshaper
-            from bidi.algorithm import get_display
-            self._shape = lambda s: get_display(arabic_reshaper.reshape(s))
-        except ImportError:
-            self._shape = lambda s: s
-
-    def font(self, size, text=""):
-        script = "ar" if self.is_rtl(text) else "cjk" if re.search(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]", text) else "latin"
-        return self._font(size, script)
-
-    @lru_cache(maxsize=48)
-    def _font(self, size, script):
-        path = self.paths[script] or self.paths["latin"] or self.paths["ar"]
-        if not path:
-            return self.ImageFont.load_default()
-        return self.ImageFont.truetype(path, size, layout_engine=self.ImageFont.Layout.BASIC)
-
-    def shape(self, s):
-        return self._shape(s) if re.search(r"[؀-ۿ]", s) else s
-
-    def wrap(self, text, size, max_w):
-        f, lines, cur = self.font(size, text), [], ""
-        for word in text.split():
-            trial = (cur + " " + word).strip()
-            if f.getlength(self.shape(trial)) <= max_w or not cur:
-                cur = trial
-            else:
-                lines.append(cur)
-                cur = word
-        if cur:
-            lines.append(cur)
-        return lines
-
-    def is_rtl(self, s):
-        return bool(re.search(r"[؀-ۿ]", s))
-
-    @lru_cache(maxsize=64)
-    def label(self, text, size, color):
-        """Small single-line label as a BGRA array (cached)."""
-        from PIL import Image, ImageDraw
-        f = self.font(size, text)
-        s = self.shape(text)
-        w = int(f.getlength(s)) + 8
-        img = Image.new("RGBA", (max(w, 1), int(size * 1.5)), (0, 0, 0, 0))
-        ImageDraw.Draw(img).text((4, 0), s, font=f, fill=(color[2], color[1], color[0], 255))
-        return np.asarray(img)[:, :, [2, 1, 0, 3]].copy()
-
-
-def blit(dst, bgra, x, y, alpha=1.0):
-    h, w = bgra.shape[:2]
-    x0, y0, x1, y1 = max(x, 0), max(y, 0), min(x + w, dst.shape[1]), min(y + h, dst.shape[0])
-    if x1 <= x0 or y1 <= y0:
-        return
-    src = bgra[y0 - y:y1 - y, x0 - x:x1 - x].astype(np.float32)
-    a = src[..., 3:4] / 255 * alpha
-    roi = dst[y0:y1, x0:x1].astype(np.float32)
-    dst[y0:y1, x0:x1] = (roi * (1 - a) + src[..., :3] * a).astype(np.uint8)
-
-
-def round_rect(img, x0, y0, x1, y1, r, color, alpha):
-    over = img[y0:y1, x0:x1].copy()
-    mask = np.zeros(over.shape[:2], np.uint8)
-    cv2.rectangle(mask, (r, 0), (x1 - x0 - r, y1 - y0), 255, -1)
-    cv2.rectangle(mask, (0, r), (x1 - x0, y1 - y0 - r), 255, -1)
-    for cx, cy in ((r, r), (x1 - x0 - r, r), (r, y1 - y0 - r), (x1 - x0 - r, y1 - y0 - r)):
-        cv2.circle(mask, (cx, cy), r, 255, -1, cv2.LINE_AA)
-    a = (mask.astype(np.float32) / 255 * alpha)[..., None]
-    img[y0:y1, x0:x1] = (over * (1 - a) + np.array(color, np.float32) * a).astype(np.uint8)
-
-
-def render_card(text_r, kind_label, say, math_line=None, question=None):
-    """Answer card as a BGRA image, built once per answer."""
-    from PIL import Image, ImageDraw
-    cw, pad = min(W - 48, 900), 26
-    inner = cw - pad * 2
-    say_lines = text_r.wrap(say, 34, inner)
-    math_lines = text_r.wrap(math_line, 36, inner) if math_line else []
-    q_lines = text_r.wrap(f"“{question}”", 26, inner) if question else []
-    h = (pad + 34 + len(q_lines) * 36 + (8 if q_lines else 0) + sum(48 for _ in math_lines)
-         + (10 if math_lines else 0) + len(say_lines) * 48 + pad)
-    img = Image.new("RGBA", (cw, h), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-    d.rounded_rectangle((0, 0, cw - 1, h - 1), radius=28, fill=(16, 16, 18, 205))
-    rtl = text_r.is_rtl(say)
-    y = pad
-    lbl = text_r.shape(kind_label)
-    lf = text_r.font(22, kind_label)
-    lw = lf.getlength(lbl)
-    d.text((cw - pad - lw if rtl else pad, y), lbl, font=lf, fill=(ACCENT[2], ACCENT[1], ACCENT[0], 255))
-    y += 38
-    for ln in q_lines:
-        s, f = text_r.shape(ln), text_r.font(26, ln)
-        x = cw - pad - f.getlength(s) if text_r.is_rtl(ln) else pad
-        d.text((x, y), s, font=f, fill=(170, 170, 178, 255))
-        y += 36
-    if q_lines:
-        y += 8
-    for ln in math_lines:
-        d.text((pad, y), ln, font=text_r.font(36, ln), fill=(255, 255, 255, 255))
-        y += 48
-    if math_lines:
-        y += 10
-    for ln in say_lines:
-        s = text_r.shape(ln)
-        f = text_r.font(34, ln)
-        x = cw - pad - f.getlength(s) if rtl else pad
-        d.text((x, y), s, font=f, fill=(240, 240, 240, 255))
-        y += 48
-    return np.asarray(img)[:, :, [2, 1, 0, 3]].copy()
-
-
-def render_word_card(text_r, tag, word, pron, en, ar, example):
-    """Vocabulary card: big word, pronunciation, meanings, example."""
-    from PIL import Image, ImageDraw
-    cw, pad = min(W - 48, 470), 22
-    inner = cw - pad * 2
-    rows = [(tag, 20, ACCENT, 30), (word, 64, (255, 255, 255), 78), (pron, 30, ACCENT, 42)]
-    meaning = " · ".join(x for x in (en, ar) if x)
-    if meaning:
-        rows.append((meaning, 26, (215, 215, 220), 38))
-    for ln in text_r.wrap(example, 22, inner) if example else []:
-        rows.append((ln, 22, (165, 165, 172), 30))
-    h = pad * 2 + sum(r[3] for r in rows)
-    img = Image.new("RGBA", (cw, h), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-    d.rounded_rectangle((0, 0, cw - 1, h - 1), radius=26, fill=(16, 16, 18, 215))
-    y = pad
-    for text, size, col, step in rows:
-        if " · " in text and text_r.is_rtl(text):            # "cup · كوباية": draw the two halves separately
-            left, right = text.split(" · ", 1)
-            fl, fr = text_r.font(size, left), text_r.font(size, right)
-            sr = text_r.shape(right)
-            total = fl.getlength(left + "  ·  ") + fr.getlength(sr)
-            x = (cw - total) / 2
-            d.text((x, y), left + "  ·  ", font=fl, fill=(col[2], col[1], col[0], 255))
-            d.text((x + fl.getlength(left + "  ·  "), y), sr, font=fr, fill=(col[2], col[1], col[0], 255))
-        else:
-            s, f = text_r.shape(text), text_r.font(size, text)
-            d.text(((cw - f.getlength(s)) / 2, y), s, font=f, fill=(col[2], col[1], col[0], 255))
-        y += step
-    return np.asarray(img)[:, :, [2, 1, 0, 3]].copy()
-
-
-def render_sticker(text_r, word, pron, ink):
-    """Small label that stays stuck where you circled the object."""
-    from PIL import Image, ImageDraw
-    fw, fp = text_r.font(40, word), text_r.font(20, pron)
-    w = int(max(fw.getlength(word), fp.getlength(pron))) + 36
-    h = 92 if pron else 64
-    img = Image.new("RGBA", (w, h + 14), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-    d.rounded_rectangle((0, 0, w - 1, h - 1), radius=16, fill=(16, 16, 18, 215), outline=(ink[2], ink[1], ink[0], 255), width=3)
-    d.polygon([(w / 2 - 9, h - 2), (w / 2 + 9, h - 2), (w / 2, h + 12)], fill=(ink[2], ink[1], ink[0], 255))
-    d.text(((w - fw.getlength(word)) / 2, 8), word, font=fw, fill=(255, 255, 255, 255))
-    if pron:
-        d.text(((w - fp.getlength(pron)) / 2, 60), pron, font=fp, fill=(ACCENT[2], ACCENT[1], ACCENT[0], 255))
-    return np.asarray(img)[:, :, [2, 1, 0, 3]].copy()
-
-
-# --------------------------------------------------------------------------- hands
-class OneEuro:
-    """Jitter filter that stays responsive on fast strokes."""
-
-    def __init__(self, min_cutoff=1.2, beta=0.012, d_cutoff=1.0):
-        self.min_cutoff, self.beta, self.d_cutoff = min_cutoff, beta, d_cutoff
-        self.x = self.dx = None
-
-    @staticmethod
-    def _a(cutoff, dt):
-        tau = 1 / (2 * np.pi * cutoff)
-        return 1 / (1 + tau / dt)
-
-    def __call__(self, x, dt):
-        x = np.asarray(x, np.float32)
-        if self.x is None:
-            self.x, self.dx = x, np.zeros_like(x)
-            return x
-        dx = (x - self.x) / dt
-        self.dx = self.dx + self._a(self.d_cutoff, dt) * (dx - self.dx)
-        cutoff = self.min_cutoff + self.beta * np.linalg.norm(self.dx)
-        self.x = self.x + self._a(cutoff, dt) * (x - self.x)
-        return self.x
-
-    def reset(self):
-        self.x = self.dx = None
-
-
-def read_hand(L):
-    """Gesture facts from 21 landmarks in pixels."""
-    palm_w = np.linalg.norm(L[5] - L[17]) + 1e-6
-    palm_c = L[[0, 5, 9, 13, 17]].mean(axis=0)
-    ext = [np.linalg.norm(L[t] - L[0]) > np.linalg.norm(L[p] - L[0]) * 1.12
-           for t, p in ((8, 6), (12, 10), (16, 14), (20, 18))]
-    folded = [np.linalg.norm(L[t] - palm_c) < palm_w * 0.95 for t in (8, 12, 16, 20)]
-    size = max(palm_w, 0.8 * np.linalg.norm(L[0] - L[9]))   # stays stable when the hand turns sideways
-    pinch = np.linalg.norm(L[4] - L[8]) / size
-    thumb_up = (L[4][1] < L[3][1] < L[2][1]) and (L[2][1] - L[4][1] > palm_w * 0.55) and L[4][1] < L[5][1] - palm_w * 0.25
-    return dict(
-        pinch=pinch,
-        pointing=ext[0] and not any(ext[1:]),   # index finger out, the rest curled: a "pen"
-        tip=L[8].copy(),
-        mid=(L[4] + L[8]) / 2,
-        thumbs_up=thumb_up and all(folded),
-        fist=all(folded) and not thumb_up and pinch > 0.36,
-        open_palm=all(ext) and pinch > 0.9,
-        center=palm_c,
-    )
-
-
-class Shape(list):
-    """A stroke that was snapped to a clean shape: drawn as-is (no smoothing, keeps sharp corners)."""
-    closed = True
-
-
-def snap_shape(stroke):
-    """Rough circle / square / rectangle / triangle / line  ->  the clean geometric version (or None)."""
-    pts = np.asarray(stroke, np.float32)
-    if len(pts) < 8:
-        return None
-    x, y, w, h = cv2.boundingRect(pts)
-    size = max(w, h)
-    if size < 40:
-        return None
-    length = float(np.sum(np.linalg.norm(np.diff(pts, axis=0), axis=1)))
-    gap = float(np.linalg.norm(pts[0] - pts[-1]))
-
-    if gap > 0.35 * size:                                   # open stroke: only a straight line gets snapped
-        a, b = pts[0], pts[-1]
-        d = b - a
-        n = np.linalg.norm(d)
-        if n < 40:
-            return None
-        rel = pts - a
-        dist = np.abs(d[0] * rel[:, 1] - d[1] * rel[:, 0]) / n
-        if dist.max() < 0.08 * n and length < 1.25 * n:
-            line = Shape([a, b])
-            line.closed = False
-            return line
-        return None
-
-    poly = pts.reshape(-1, 1, 2)
-    hull = cv2.convexHull(poly)
-    hull_area = cv2.contourArea(hull)
-    if hull_area < 300:
-        return None
-    (cx, cy), (rw, rh), ang = cv2.minAreaRect(hull)
-    fill = hull_area / max(rw * rh, 1)        # how much of its bounding box the shape fills:
-    #                                           rectangle ~1.0, circle/ellipse ~0.79, triangle ~0.5
-    corners = cv2.approxPolyDP(hull, 0.07 * cv2.arcLength(hull, True), True).reshape(-1, 2)
-
-    if fill > 0.88:
-        if abs(rw - rh) < 0.15 * max(rw, rh):              # nearly equal sides -> square
-            rw = rh = (rw + rh) / 2
-        level = 90 * round(ang / 90)                        # nearly level -> make it level
-        if abs(ang - level) < 10:
-            ang = level
-        return Shape(list(cv2.boxPoints(((cx, cy), (rw, rh), ang)).astype(np.float32)))
-    if 0.68 < fill <= 0.88:
-        (ex, ey), (ew, eh), eang = cv2.fitEllipse(pts)
-        if min(ew, eh) > 0.8 * max(ew, eh):                 # nearly round -> perfect circle
-            ew = eh = (ew + eh) / 2
-        ring = cv2.ellipse2Poly((int(ex), int(ey)), (int(ew / 2), int(eh / 2)), int(eang), 0, 360, 6)
-        return Shape(list(ring.astype(np.float32)))
-    if fill <= 0.68 and len(corners) == 3:
-        return Shape(list(corners.astype(np.float32)))
-    return None
-
-
-def stroke_points(s):
-    """Points to draw for a stroke: snapped shapes as-is (closed), freehand smoothed."""
-    if isinstance(s, Shape):
-        pts = np.array(s, np.int32)
-        return pts, s.closed
-    return chaikin(s), False
-
-
-def chaikin(pts, rounds=2):
-    p = np.asarray(pts, np.float32)
-    for _ in range(rounds):
-        if len(p) < 3:
-            break
-        q, r = 0.75 * p[:-1] + 0.25 * p[1:], 0.25 * p[:-1] + 0.75 * p[1:]
-        p = np.vstack([p[:1], np.stack([q, r], 1).reshape(-1, 2), p[-1:]])
-    return p.astype(np.int32)
+def stroke_size(s):
+    p = np.asarray(s, np.float32)
+    return float(max(p.max(axis=0) - p.min(axis=0))) if len(p) > 1 else 0.0
 
 
 # --------------------------------------------------------------------------- app
 class AirMind:
-    def __init__(self, vlm, lang, voices, muted=False):
+    def __init__(self, vlm, lang, voices, muted=False, vocab=None):
         self.vlm, self.voices, self.muted = vlm, voices, muted
         self.set_lang(lang)
         self.text = Text()
@@ -676,18 +147,29 @@ class AirMind:
         self.ended_at = -1.0
         self.band = (0, 0, W, H)
         self.listener, self.stt, self.last_frame = Listener(), None, None
-        self.frozen, self.frozen_t = None, 0.0                   # (still picture of the red box, its x/y) while thinking
+        self.listen_purpose = "ask"                              # "ask" | "practice"
+        self.frozen, self.frozen_t = None, 0.0                   # still picture of the asked area while thinking
         self.speech_q, self.speech_status, self.last_spoken = queue.Queue(), None, []
         threading.Thread(target=self._speech_loop, daemon=True).start()
-        self.ink_i, self.learn, self.stickers = 0, None, []     # learn: None | "zh" | "en"
-        self.snap = True                                         # tidy rough shapes into clean ones
+        self.ink_i, self.learn = 0, None                         # learn: None | "zh" | "en"
+        self.mode = None                                         # None | "read" | "find"
+        self.board, self.pending_stickers = StickerBoard(), queue.Queue()
+        self.frames, self.auto = FrameBuffer(), AutoCapture()
+        self.detector = InstantDetector()
+        self.vocab = vocab
+        self.word = None                                         # the word on screen (for 1/2/3, Y, follow-ups)
+        self.context = None                                      # last picture + conversation, for follow-ups
+        self.find = None                                         # the "find it" game state
+        self.point = {"box": None, "t": 0.0, "done": None}       # instant-mode pointing
+        self.label_cache = {}
+        self.snap = True
         self.zone = "right"                                      # fixed red ask zone: "right" | "left" | None
         self.filter = OneEuro()
         self.hold = {"ask": 0.0, "clear": 0.0, "listen": 0.0}
-        self.thinking, self.card, self.card_t = False, None, 0.0
-        self.cursor = None
+        self.thinking, self.card, self.card_t, self.card_corner, self.card_life = False, None, 0.0, False, 8.0
+        self.cursor, self.g, self.hand_centers = None, None, []
+        self.card_left = True
         self.rec = None
-        self.started = time.perf_counter()
         self.tmp = Path(tempfile.mkdtemp(prefix="airmind_"))
         self.say_n = 0
 
@@ -696,7 +178,6 @@ class AirMind:
         return INKS[self.ink_i][1]
 
     def zone_rect(self):
-        """The red box, on your right side of the mirrored picture (or left)."""
         bx, by, bw, bh = self.band
         w, h = int(bw * 0.30), int(bh * 0.55)
         x = bx + bw - w - int(bw * 0.04) if self.zone == "right" else bx + int(bw * 0.04)
@@ -712,12 +193,25 @@ class AirMind:
     def cycle_learn(self):
         order = [None, "zh", "en"]
         self.learn = order[(order.index(self.learn) + 1) % len(order)]
+        if self.learn and self.mode == "read":
+            self.mode = None
         self.card = None
+
+    def toggle_mode(self, mode):
+        self.mode = None if self.mode == mode else mode
+        self.card = None
+        if self.mode == "find":
+            self.next_find()
+        else:
+            self.find = None
 
     def set_lang(self, lang):
         self.lang, self.ui, self.voice = lang, UI[lang], self.voices.get(lang)
         if self.vlm:
             self.vlm.lang = lang
+
+    def info(self, msg, kind="info"):
+        self.show(KIND_LABEL[self.lang][kind], msg)
 
     # ---- gestures -----------------------------------------------------------
     def update_hand(self, hand, dt, other=None):
@@ -725,11 +219,12 @@ class AirMind:
         cmd = self._commands(read_hand(other), dt) if other is not None else None
         if hand is None:
             self.end_stroke()
-            self.cursor = None
+            self.cursor, self.g = None, None
             if other is None:
                 self.hold = {"ask": 0.0, "clear": 0.0, "listen": 0.0}
             return cmd
         g = read_hand(hand)
+        self.g = g
         p = self.filter(g["mid"], dt)
         self.cursor = p
         if not self.drawing and g["pinch"] < 0.20:          # fingertips really touching
@@ -756,38 +251,52 @@ class AirMind:
         return fired, g["center"]
 
     def end_stroke(self):
-        if self.drawing and self.cur is not None and len(self.cur) < 3 and self.strokes:
-            self.strokes.pop()
-        elif self.drawing and self.snap and self.cur is not None and self.strokes and self.strokes[-1] is self.cur:
-            shape = snap_shape(self.cur)
-            if shape is not None:
-                self.strokes[-1] = shape
+        if self.drawing and self.cur is not None and self.strokes and self.strokes[-1] is self.cur:
+            if len(self.cur) < 3 or stroke_size(self.cur) < MIN_STROKE:
+                self.strokes.pop()                     # fingers holding an object, not a drawing
+            elif self.snap:
+                shape = snap_shape(self.cur)
+                if shape is not None:
+                    self.strokes[-1] = shape
         if self.drawing:
             self.ended_at = time.perf_counter()
         self.drawing, self.cur, self.pinch_frames, self.off_frames = False, None, 0, 0
         self.filter.reset()
 
     def clear(self):
-        self.strokes, self.card, self.stickers = [], None, []
+        self.strokes, self.card = [], None
+        self.board.clear()
+        self.auto.forget()
         self.unfreeze()
 
-    # ---- asking -------------------------------------------------------------
     # ---- listening ----------------------------------------------------------
-    def toggle_listen(self):
+    def toggle_listen(self, purpose="ask"):
         if self.listener.active:
             self._finish_listening()
             return
         if self.thinking:
             return
         if self.stt is None or self.stt.error == "missing":
-            self.show(KIND_LABEL[self.lang]["error"], self.ui["no_stt"])
+            self.info(self.ui["no_stt"], "error")
             return
+        if purpose == "practice" and not self.practice_target():
+            self.info(self.ui["no_word"], "error")
+            return
+        self.listen_purpose = purpose
         self.stt.ensure_loaded()
         try:
             self.listener.start()
-            self.card = None
+            if purpose == "ask":
+                self.card = None
         except Exception as e:
-            self.show(KIND_LABEL[self.lang]["error"], f"Mic: {e}"[:160])
+            self.info(f"Mic: {e}"[:160], "error")
+
+    def practice_target(self):
+        if self.word and self.word.get("target", "zh") == "zh":
+            return self.word.get("say") or self.word["word"]
+        if self.find:
+            return self.find["word"]
+        return None
 
     def tick_listening(self):
         if self.listener.active and self.listener.should_stop():
@@ -796,166 +305,403 @@ class AirMind:
     def _finish_listening(self):
         audio, heard = self.listener.stop()
         if not heard or len(audio) < Listener.RATE // 2:
-            self.show(KIND_LABEL[self.lang]["error"], self.ui["didnt_hear"])
+            self.info(self.ui["didnt_hear"], "error")
             return
         self.thinking = True
-        threading.Thread(target=self._transcribe_then_ask, args=(audio,), daemon=True).start()
+        threading.Thread(target=self._transcribe_then_act, args=(audio, self.listen_purpose), daemon=True).start()
 
-    def _transcribe_then_ask(self, audio):
+    def _transcribe_then_act(self, audio, purpose):
         try:
-            text = self.stt.transcribe(audio)
+            if purpose == "practice":
+                text, _ = self.stt.transcribe(audio, force="zh")
+            else:
+                allowed = ("zh", "ar", "en") if self.learn == "zh" else ("ar", "en")
+                text, lang = self.stt.transcribe(audio, allowed=allowed)
         except Exception as e:
             text, self.stt.error = None, str(e)
         self.thinking = False
-        if not text:
-            self.show(KIND_LABEL[self.lang]["error"], self.ui["didnt_hear"] if self.stt.model else f"Speech: {self.stt.error}")
+        if purpose == "practice":
+            self.check_pronunciation(text or "")
             return
-        print("You said:", text)
+        if not text:
+            self.info(self.ui["didnt_hear"] if self.stt.model else f"Speech: {self.stt.error}", "error")
+            return
+        print("You said:", text, flush=True)
         self.ask(self.last_frame, question=text)
 
-    def ask(self, frame, question=None):
-        if self.thinking or frame is None:
+    def check_pronunciation(self, heard):
+        target = self.practice_target()
+        if not target:
             return
-        if self.vlm is None:
-            self.show(KIND_LABEL[self.lang]["error"], self.ui["no_server"])
-            return
-        has_strokes = any(len(s) > 1 for s in self.strokes)
-        # What the model looks at, in order of priority:
-        #   1) you drew something  -> a close-up around your drawing (the object you marked)
-        #   2) the red box is on   -> a close-up of what's inside the box
-        #   3) otherwise           -> the whole camera view
-        anchor = None
-        if has_strokes:
-            pts = np.array([p for s in self.strokes for p in s], np.float32)
+        score, rows = chinese.compare_pronunciation(target, heard)
+        print(f"practice {target}: heard {heard!r} -> {score:.0%}", flush=True)
+        self.card = ui.render_pron_card(self.text, target, score, rows, heard)
+        self.card_t, self.card_corner, self.card_life = time.perf_counter(), True, 10.0
+        if self.vocab and self.vocab.get(target):
+            self.vocab.result(target, score >= 0.99, "say")
+        if score < 0.99:
+            self.speak(target, voice=self.voices.get("zh"), rate=110)       # hear it again, slowly
+
+    # ---- choosing what the model sees ------------------------------------------
+    def _region(self):
+        """(rect, strokes_used, anchor_box). Priority: your drawing > the red box > the whole view."""
+        real = [s for s in self.strokes if len(s) > 1 and stroke_size(s) >= MIN_STROKE]
+        if real:
+            pts = np.array([p for s in real for p in s], np.float32)
             x0, y0 = pts.min(axis=0)
             x1, y1 = pts.max(axis=0)
-            side = max(x1 - x0, y1 - y0, 160) * 1.35                    # square-ish, with a margin
+            side = max(x1 - x0, y1 - y0, 160) * 1.35
             cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
             rx, ry = int(max(0, cx - side / 2)), int(max(0, cy - side / 2))
             rw, rh = int(min(W - rx, side)), int(min(H - ry, side))
-            anchor = np.array([cx, y0 - 4])                              # sticker sits on top of the drawing
-        elif self.zone:
-            rx, ry, rw, rh = self.zone_rect()
-        else:
-            rx, ry, rw, rh = self.band
-        clean = frame[ry:ry + rh, rx:rx + rw].copy()
-        marked = frame.copy()
-        for s in self.strokes:
-            if len(s) > 1:
-                pts_s, closed = stroke_points(s)
-                cv2.polylines(marked, [pts_s], closed, SEND_INK, 4, cv2.LINE_AA)
-        crop = marked[ry:ry + rh, rx:rx + rw]
-        k = 512 / max(rw, rh) if (has_strokes or self.zone) else 768 / max(rw, rh)
-        crop = cv2.resize(crop, (max(1, int(rw * k)), max(1, int(rh * k))),
-                          interpolation=cv2.INTER_CUBIC if k > 1 else cv2.INTER_AREA)
-        ok, jpeg = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            return (rx, ry, rw, rh), real, (int(x0), int(y0), int(x1 - x0), int(y1 - y0))
+        if self.zone:
+            x, y, w, h = r = self.zone_rect()
+            return r, [], (x + w // 5, y + h // 5, w * 3 // 5, h * 3 // 5)   # sticker/tracker: the middle of the box
+        return self.band, [], None
+
+    def _encode(self, img, longest):
+        h, w = img.shape[:2]
+        k = longest / max(w, h)
+        img = cv2.resize(img, (max(1, int(w * k)), max(1, int(h * k))),
+                         interpolation=cv2.INTER_CUBIC if k > 1 else cv2.INTER_AREA)
+        return cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 90])[1].tobytes()
+
+    def ask(self, frame, question=None, auto=False):
+        if self.thinking or frame is None:
+            return
+        if self.vlm is None:
+            self.info(self.ui["no_server"], "error")
+            return
+        (rx, ry, rw, rh), strokes, box = self._region()
+        has_strokes = bool(strokes)
+        self.card_left = rx + rw / 2 > W / 2                    # put the answer on the other side of the object
         focus = has_strokes or bool(self.zone)
+        # the sharpest of the last ~0.5 s of frames: the latest one is often blurred by the thumbs-up
+        sharp, _ = self.frames.best((rx, ry, rw, rh))
+        base = sharp if sharp is not None else frame
+        clean = base[ry:ry + rh, rx:rx + rw].copy()
+        marked = base.copy()
+        for s in strokes:
+            pts_s, closed = stroke_points(s)
+            cv2.polylines(marked, [pts_s], closed, SEND_INK, 4, cv2.LINE_AA)
+        crop = marked[ry:ry + rh, rx:rx + rw]
+        jpeg = self._encode(crop, 512 if focus else 768)
         if focus:                                  # that area holds still until the answer goes away
             self.frozen, self.frozen_t = (clean, (rx, ry)), time.perf_counter()
+        follow = (question and self.context and time.perf_counter() - self.context["t"] < CONTEXT_SECONDS
+                  and not has_strokes and self.mode is None)
         self.thinking, self.card = True, None
-        if self.learn and not question:
-            threading.Thread(target=self._learn_worker, args=(jpeg.tobytes(), has_strokes, anchor, self.learn, focus),
-                             daemon=True).start()
+        job = dict(jpeg=jpeg, has_strokes=has_strokes, focus=focus, question=question, clean=clean,
+                   box=box, frame=base)
+        if follow:
+            job["jpeg"] = self.context["jpeg"]             # same picture as before
+            target = self._tutor_worker if self.context["kind"] in ("learn", "tutor") else self._ask_worker
+            job["history"] = self.context["history"]
+        elif self.mode == "read" and not question:
+            job["jpeg"] = self._encode(base[ry:ry + rh, rx:rx + rw], 1280)
+            target = self._read_worker
+        elif self.mode == "find" and self.find and not question:
+            target = self._find_worker
+        elif self.learn and question:
+            target = self._tutor_worker
+        elif self.learn:
+            target = self._learn_worker
         else:
-            threading.Thread(target=self._ask_worker, args=(jpeg.tobytes(), has_strokes, question, focus),
-                             daemon=True).start()
+            target = self._ask_worker
+        threading.Thread(target=self._guard, args=(target, job), daemon=True).start()
         if has_strokes and not self.learn:
             self.strokes = []
 
-    def _learn_worker(self, jpeg, has_strokes, anchor, target, focus=False):
+    def _guard(self, fn, job):
         try:
-            d = parse_json(self.vlm.ask_learn(jpeg, has_strokes, target, focus))
-            word = str(d.get("word") or "").strip()
-            if not word:
-                raise ValueError("no word in the reply")
-            pron, en, ar, ex = (str(d.get(k) or "").strip() for k in ("pron", "en", "ar", "example"))
-            self.card = render_word_card(self.text, f"{LEARN_TAG[target]}", word, pron,
-                                         en if target != "en" else "", ar, ex)
-            self.card_t, self.card_corner = time.perf_counter(), True
-            if anchor is not None:                          # drawn circle -> sticker on the object
-                self.stickers.append((anchor, render_sticker(self.text, word, pron, self.ink)))
-                self.stickers = self.stickers[-12:]
-                self.strokes = []
-            self.thinking = False
-            self.speak(word, voice=self.voices.get(target), rate=140)          # 杯子
-            if target == "zh" and en:
-                self.speak(en, voice=self.voices.get("en"))                   # ... "cup"
-            elif target == "en" and ar:
-                self.speak(ar, voice=self.voices.get("ar"))
+            fn(job)
         except Exception as e:
             self.unfreeze()
-            self.show(KIND_LABEL[self.lang]["error"], f"{type(e).__name__}: {e}"[:160])
+            msg = f"{type(e).__name__}: {e}"
+            if isinstance(e, urllib.error.URLError):
+                msg = f"{self.ui['no_server']} ({e.reason})"
+            self.info(msg[:160], "error")
+            print("error:", msg, flush=True)
         finally:
             self.thinking = False
 
-    def _ask_worker(self, jpeg, has_strokes, question=None, focus=False):
-        try:
-            kind, say, expr = parse_reply(self.vlm.ask(jpeg, has_strokes, question, focus))
-            math_line = None
-            if kind == "math" or expr:
-                solved = solve_math(expr) if expr else None
-                if solved:
-                    math_line, ans = solved
-                    kind = "math"
-                    say = f"{self.ui['answer']} {ans}" if not say or len(say) > 90 else say
-            if question:
-                kind = "answer" if kind not in ("math",) else kind
-            label = KIND_LABEL[self.lang].get(kind, KIND_LABEL[self.lang]["scene"])
-            self.show(label, say, math_line, question)
-            if focus:
-                self.card_corner = True                    # red-box answers sit beside the box and fade out
-            self.speak(say)
-        except Exception as e:
-            self.unfreeze()
-            self.show(KIND_LABEL[self.lang]["error"], f"{type(e).__name__}: {e}"[:160])
-        finally:
-            self.thinking = False
+    # ---- 1) normal questions --------------------------------------------------
+    def _ask_worker(self, job):
+        history = job.get("history")
+        raw = self.vlm.ask(job["jpeg"], job["has_strokes"], job["question"], job["focus"], history=history)
+        kind, say, expr = parse_reply(raw)
+        math_line = None
+        if kind == "math" or expr:
+            solved = solve_math(expr) if expr else None
+            if solved:
+                math_line, ans = solved
+                kind = "math"
+                say = f"{self.ui['answer']} {ans}" if not say or len(say) > 90 else say
+        if job["question"]:
+            kind = "answer" if kind != "math" else kind
+        label = KIND_LABEL[self.lang].get(kind, KIND_LABEL[self.lang]["scene"])
+        self.show(label, say, math_line, job["question"])
+        if job["focus"]:
+            self.card_corner, self.card_life = True, 10.0
+        self.speak(say)
+        prompt = job["question"] or "What is it?"
+        hist = (history or []) + [(prompt, raw)]
+        self.context = {"kind": "ask", "jpeg": job["jpeg"], "history": hist[-4:], "t": time.perf_counter()}
 
+    # ---- 2) learn a word ------------------------------------------------------
+    def _learn_worker(self, job):
+        target = self.learn
+        raw = self.vlm.ask_learn(job["jpeg"], job["has_strokes"], target, job["focus"])
+        cands, ex, ex_tr = parse_learn(raw)
+        if not cands:
+            raise ValueError("no word in the reply")
+        first = cands[0]["word"]                                  # the example sentence was written for this one
+        if target == "zh":
+            best = chinese.best_candidate(cands) or cands[0]      # first candidate that is a real dictionary word
+            cands = [best] + [c for c in cands if c is not best]
+        info = self._make_word(cands[0], target, ex, ex_tr, cands)
+        info["first_example"] = (ex, ex_tr, first)
+        self._show_word(info, job, new=True)
+
+    def _make_word(self, cand, target, ex, ex_tr, cands):
+        w = cand["word"]
+        info = {"target": target, "word": w, "conf": cand["confidence"], "en": cand["en"], "ar": cand["ar"],
+                "alts": [c["word"] for c in cands], "cands": cands, "verified": True}
+        if target == "zh":
+            v = chinese.verify(w)
+            w = info["word"] = v["word"]
+            info.update(verified=v["found"], tones=v["tones"], pinyin=v["pinyin"], hsk=v["hsk"],
+                        en=v["en_dict"] or cand["en"])
+            mp = chinese.measure_phrase(w, v["measure"])
+            if mp:
+                info["measure_phrase"], info["measure_py"] = mp
+            if ex and w in ex:                                    # the example must use THIS word
+                info.update(example=ex, example_py=chinese.sentence_pinyin(ex), example_tr=ex_tr)
+        else:
+            if ex and w.lower() in ex.lower():
+                info.update(example=ex, example_tr=ex_tr)
+        return info
+
+    def _show_word(self, info, job, new):
+        if not job.get("focus"):
+            self.unfreeze()
+        self.word = info
+        self.card = ui.render_learn_card(self.text, info)
+        self.card_t, self.card_corner = time.perf_counter(), True
+        self.card_life = 14.0 if len(info["alts"]) > 1 else 8.0
+        w, target = info["word"], info["target"]
+        sticker = render_sticker(self.text, w, info.get("pinyin", ""), self.ink)
+        if new and job.get("box") is not None:
+            self.pending_stickers.put((sticker, job["box"], job["frame"]))
+            self.strokes = []
+        elif not new and len(self.board):
+            self.board.items[-1].img = sticker                     # picked another candidate: relabel
+        audio = None
+        if self.vocab:
+            if not new and job.get("replaced") and self.vocab.get(job["replaced"]) and self.vocab.get(job["replaced"])["seen"] <= 1:
+                self.vocab.remove(job["replaced"])
+            entry = dict(word=w, lang=target, pinyin=info.get("pinyin", ""), en=info.get("en", ""), ar=info.get("ar", ""),
+                         measure=(f"{info['measure_phrase']}  {info['measure_py']}" if info.get("measure_phrase") else ""),
+                         hsk=info.get("hsk"), example=info.get("example", ""), example_pinyin=info.get("example_py", ""),
+                         example_en=info.get("example_tr", ""), verified=int(info["verified"]))
+            jpeg = cv2.imencode(".jpg", job["clean"], [cv2.IMWRITE_JPEG_QUALITY, 88])[1].tobytes() \
+                if job.get("clean") is not None and job["clean"].size else None
+            self.vocab.add(entry, jpeg)
+            if not (self.vocab.get(w) or {}).get("audio"):
+                audio = self.vocab.audio_path(w)
+        self.context = {"kind": "learn", "jpeg": job["jpeg"], "history": [], "t": time.perf_counter(), "job": job}
+        self.thinking = False
+        self.speak(w, voice=self.voices.get(target), rate=140,
+                   save_to=audio, on_done=(lambda ok, w=w, a=audio: ok and self.vocab.set_audio(w, a)) if audio else None)
+        if target == "zh" and info.get("en"):
+            self.speak(info["en"].split(";")[0], voice=self.voices.get("en"))
+        elif target == "en" and info.get("ar"):
+            self.speak(info["ar"], voice=self.voices.get("ar"))
+
+    def choose(self, i):
+        """Keys 1/2/3: the model wasn't sure, take its other candidate instead."""
+        if not self.word or i >= len(self.word.get("cands", [])) or self.thinking:
+            return
+        cands = self.word["cands"]
+        pick = cands[i]
+        if pick["word"] == self.word["word"]:
+            return
+        ex, ex_tr, ex_word = self.word.get("first_example", ("", "", ""))
+        info = self._make_word(pick, self.word["target"], ex if ex_word == pick["word"] else "", ex_tr, cands)
+        info["first_example"] = self.word.get("first_example")
+        job = dict(self.context.get("job", {}) if self.context else {})
+        job["replaced"] = self.word["word"]
+        self._show_word(info, job, new=False)
+
+    # ---- 3) questions to the Chinese tutor ----------------------------------------
+    def _tutor_worker(self, job):
+        ctx_word = self.word["word"] if self.word else None
+        history = job.get("history") or []
+        raw = self.vlm.ask_tutor(job["jpeg"], job["question"], ctx_word, history=history)
+        d = parse_json(raw)
+        zh = str(d.get("zh") or "").strip()
+        if not zh:
+            raise ValueError("no answer in the reply")
+        py = chinese.sentence_pinyin(zh)
+        self.card = ui.render_tutor_card(self.text, job["question"], zh, py, d.get("en", ""), d.get("ar", ""),
+                                         d.get("tip", ""))
+        self.card_t, self.card_corner, self.card_life = time.perf_counter(), False, 0
+        if self.word is None or self.word.get("target") != "zh":
+            self.word = {"target": "zh", "word": zh, "say": zh, "cands": [], "alts": []}
+        else:
+            self.word = dict(self.word, say=zh)                   # Y now practices this sentence
+        self.thinking = False
+        self.speak(zh, voice=self.voices.get("zh"), rate=150)
+        self.speak(d.get("ar") if self.lang == "ar" else d.get("en"))
+        hist = history + [(f'My question: "{job["question"]}"', raw)]
+        self.context = {"kind": "tutor", "jpeg": job["jpeg"], "history": hist[-4:], "t": time.perf_counter()}
+
+    # ---- 4) read text + halal check ------------------------------------------------
+    def _read_worker(self, job):
+        ocr_text = ocr.read_text(job["clean"]) if job.get("clean") is not None else None
+        source = "Apple OCR + model" if ocr_text else "model"
+        raw = self.vlm.ask_read(job["jpeg"], ocr_text or None)
+        d = parse_json(raw)
+        text = (ocr_text or str(d.get("text") or "")).strip()
+        verdict, hits = chinese.halal_check(f"{ocr_text or ''}\n{d.get('text') or ''}")
+        concerns = str(d.get("concerns") or "").strip()
+        if verdict is None and concerns and concerns.lower() not in ("none", "no", "n/a", "-"):
+            verdict, hits = "doubtful", [(concerns[:60], "", "doubtful")]
+        han = chinese.han_only(text)
+        py = chinese.sentence_pinyin(text) if 0 < len(han) <= 40 else ""
+        self.card = ui.render_read_card(self.text, d.get("what", ""), text, py, d.get("en", ""), d.get("ar", ""),
+                                        verdict, hits, source)
+        self.card_t, self.card_corner, self.card_life = time.perf_counter(), False, 0
+        self.unfreeze()
+        self.thinking = False
+        if verdict:
+            self.speak(self.ui[verdict])
+        tr = str(d.get("ar" if self.lang == "ar" else "en") or "")
+        self.speak(tr[:160])
+        self.context = {"kind": "ask", "jpeg": job["jpeg"], "history": [("Read this text.", raw)], "t": time.perf_counter()}
+
+    # ---- 5) the "find it" game ---------------------------------------------------
+    def next_find(self):
+        if not self.vocab or self.vocab.count() == 0:
+            self.mode, self.find = None, None
+            self.info(self.ui["no_words"], "error")
+            return
+        prev = self.find or {"ok": 0, "n": 0}
+        r = self.vocab.next_challenge(avoid=prev.get("word"))
+        if not r:
+            return
+        self.find = {"word": r["word"], "en": r["en"] or "", "ok": prev["ok"], "n": prev["n"], "state": "ask", "t": 0}
+        self.auto.forget()
+        self._find_card()
+        self.speak(r["word"], voice=self.voices.get("zh"), rate=130)
+
+    def _find_card(self, seen=None):
+        f = self.find
+        self.card = ui.render_challenge_card(self.text, f["word"], f"{f['ok']}/{f['n']}", f["state"], seen,
+                                             f["en"] if f["state"] != "ask" else None)
+        self.card_t, self.card_corner, self.card_life = time.perf_counter(), False, 0
+
+    def _find_worker(self, job):
+        f = self.find
+        d = parse_json(self.vlm.ask_check(job["jpeg"], f["word"], f["en"] or f["word"]))
+        ok = bool(d.get("match"))
+        f["n"] += 1
+        f["ok"] += ok
+        f["state"], f["t"] = ("ok" if ok else "miss"), time.perf_counter()
+        self.vocab.result(f["word"], ok, "found")
+        self._find_card(str(d.get("seen") or ""))
+        self.unfreeze()
+        self.thinking = False
+        if ok:
+            self.speak("对！", voice=self.voices.get("zh"))
+        else:
+            self.speak(f"{self.ui['wrong']} {d.get('seen') or ''}")
+            self.speak(f["word"], voice=self.voices.get("zh"), rate=120)
+
+    def tick_find(self, now):
+        f = self.find
+        if self.mode == "find" and f and f["state"] != "ask" and now - f["t"] > 3.0 and not self.thinking:
+            self.next_find()
+
+    # ---- 6) instant labels (detector) -----------------------------------------------
+    def tick_instant(self, frame, now):
+        det = self.detector
+        if not det.enabled:
+            return
+        det.feed(frame)
+        if self.g is None or not self.g.get("pointing") or self.drawing:
+            self.point["box"] = None
+            return
+        b = det.pointed(self.g["tip"])
+        key = b[5] if b else None
+        if key != self.point["box"]:
+            self.point.update(box=key, t=now)
+            return
+        if key and now - self.point["t"] > 0.9 and self.point["done"] != (key, int(self.point["t"])):
+            self.point["done"] = (key, int(self.point["t"]))
+            x0, y0, x1, y1, en, zh, _ = b
+            v = chinese.verify(zh)
+            info = {"target": "zh", "word": zh, "conf": 1.0, "en": v["en_dict"] or en, "ar": "", "alts": [zh],
+                    "cands": [], "verified": v["found"], "tones": v["tones"], "pinyin": v["pinyin"], "hsk": v["hsk"]}
+            mp = chinese.measure_phrase(zh, v["measure"])
+            if mp:
+                info["measure_phrase"], info["measure_py"] = mp
+            x0, y0, x1, y1 = (int(max(0, v_)) for v_ in (x0, y0, x1, y1))
+            clean = frame[y0:y1, x0:x1].copy()
+            jpeg = self._encode(clean, 512) if clean.size else b""
+            self._show_word(info, dict(jpeg=jpeg, clean=clean, box=(x0, y0, x1 - x0, y1 - y0), frame=frame, focus=True),
+                            new=True)
+
+    # ---- cards + speech --------------------------------------------------------------
     def show(self, label, say, math_line=None, question=None):
-        self.card_corner = False
+        self.card_corner, self.card_life = False, 0
         self.card = render_card(self.text, label, say, math_line, question)
         self.card_t = time.perf_counter()
 
-    def speak(self, text, voice=None, rate=None):
-        """Queue something to say. A single speech thread works through the queue, so nothing waits on it."""
+    def speak(self, text, voice=None, rate=None, save_to=None, on_done=None):
+        """Queue something to say. One speech thread works through the queue, so nothing waits on it."""
         if not text:
             return
         if self.muted:
             self.speech_status = ("muted (press M)", time.perf_counter())
-            print("(muted, press M to unmute)", flush=True)
+            if save_to and on_done:                            # still make the notebook audio, silently
+                self.speech_q.put((text, voice or self.voice, rate, save_to, on_done, False))
             return
         self.last_spoken.append((text, voice or self.voice, rate))
         self.last_spoken = self.last_spoken[-2:]
-        self.speech_q.put((text, voice or self.voice, rate))
+        self.speech_q.put((text, voice or self.voice, rate, save_to, on_done, True))
 
     def _speech_loop(self):
         while True:
-            text, voice, rate = self.speech_q.get()
+            text, voice, rate, save_to, on_done, play = self.speech_q.get()
             try:
                 self.speech_status = (f"speaking: {text[:40]}", time.perf_counter())
-                ok = self._say(text, voice, rate)
+                ok = self._say(text, voice, rate, save_to, play)
                 self.speech_status = (f"spoke: {text[:40]}" if ok else f"SPEECH FAILED: {text[:30]} (see Terminal)",
                                       time.perf_counter())
+                if on_done:
+                    threading.Thread(target=on_done, args=(ok,), daemon=True).start()
             except Exception as e:
                 print("speech error:", e, flush=True)
                 self.speech_status = (f"SPEECH ERROR: {e}"[:60], time.perf_counter())
 
     def replay(self):
         for text, voice, rate in list(self.last_spoken):
-            self.speech_q.put((text, voice, rate))
+            self.speech_q.put((text, voice, rate, None, None, True))
 
-    def _say(self, text, voice, rate):
-        """Say it out loud. Preferred: hand it to speaker.py (started by start.sh from the shell),
-        because `say` launched from inside this camera app can freeze. Fallback: run `say` here."""
-        path = None
-        if self.rec:
+    def _say(self, text, voice, rate, save_to=None, play=True):
+        """Preferred: hand it to speaker.py (started by start.sh from the shell), because `say` launched
+        from inside this camera app can freeze. Fallback: run `say` here."""
+        path = str(save_to) if save_to else None
+        if self.rec and not path:
             self.say_n += 1
             path = str(self.tmp / f"say_{self.say_n}.aiff")
         try:
-            r = http_json("http://127.0.0.1:8765/say", {"text": text, "voice": voice, "rate": rate, "file": path},
-                          timeout=95)
+            r = http_json("http://127.0.0.1:8765/say", {"text": text, "voice": voice, "rate": rate, "file": path,
+                                                       "play": play}, timeout=95)
             print(f"speak via helper [{voice or 'default'}] {text[:60]!r}: {'ok' if r.get('ok') else 'FAILED'}", flush=True)
-            if r.get("ok") and path:
+            if r.get("ok") and path and self.rec and play:
                 self.rec["audio"].append((time.perf_counter() - self.rec["start"], Path(path)))
             return bool(r.get("ok"))
         except (urllib.error.URLError, ConnectionError, OSError):
@@ -963,56 +709,124 @@ class AirMind:
                 self._helper_warned = True
                 print("speech helper not running (start with ./start.sh, or run: python speaker.py &)", flush=True)
         if not shutil.which("say"):
-            print("`say` not found: speech only works on macOS", flush=True)
             return False
         tries = [voice, voice.split(" (")[0]] if voice and " (" in voice else [voice]
         extra = ["-r", str(rate)] if rate else []
         for v in tries + ([None] if voice else []):
             args = ["say"] + (["-v", v] if v else []) + extra
-            if self.rec:
-                self.say_n += 1
-                path = self.tmp / f"say_{self.say_n}.aiff"
-                res = run_tool(args + ["-o", str(path), text], timeout=30)
-                if res.returncode == 0:
-                    self.rec["audio"].append((time.perf_counter() - self.rec["start"], path))
-                    run_tool(["afplay", str(path)], timeout=60)
-            else:
-                print(f"speak [{v or 'default voice'}] {text[:60]!r} ...", flush=True)
-                try:
+            try:
+                if path:
+                    res = run_tool(args + ["-o", path, text], timeout=30)
+                    if res.returncode == 0 and play:
+                        if self.rec:
+                            self.rec["audio"].append((time.perf_counter() - self.rec["start"], Path(path)))
+                        run_tool(["afplay", path], timeout=60)
+                elif play:
                     res = run_tool(args + [text], timeout=30)
-                except subprocess.TimeoutExpired:
-                    print("speak: `say` hung for 30 s. macOS audio is stuck: run  sudo killall coreaudiod", flush=True)
+                else:
                     return False
+            except subprocess.TimeoutExpired:
+                print("speak: `say` hung for 30 s. macOS audio is stuck: run  sudo killall coreaudiod", flush=True)
+                return False
             ok = res.returncode == 0 and "not found" not in (res.stderr + res.stdout).lower()
-            print(f"speak [{v or 'default voice'}] {text[:60]!r}: {'ok' if ok else 'FAILED ' + (res.stderr or res.stdout).strip()}",
-                  flush=True)
             if ok:
                 return True
         return False
 
+    def export_notebook(self):
+        if not self.vocab or self.vocab.count() == 0:
+            self.info(self.ui["no_words"], "error")
+            return
+
+        def work():
+            try:
+                p = self.vocab.export_anki()
+                self.vocab.export_csv()
+                self.info(f"{p.name}: {self.vocab.count()} words  ->  {p.parent}")
+                if shutil.which("open"):
+                    run_tool(["open", "-R", str(p)])
+            except ImportError:
+                self.info("pip install genanki", "error")
+            except Exception as e:
+                self.info(f"{type(e).__name__}: {e}"[:160], "error")
+        threading.Thread(target=work, daemon=True).start()
+
+    # ---- per-frame work ---------------------------------------------------------------
+    def tick(self, frame, now):
+        self.frames.push(frame, now)
+        while not self.pending_stickers.empty():
+            img, box, f = self.pending_stickers.get()
+            self.board.add(img, box, f)
+        self.board.update(frame)
+        self.tick_find(now)
+        self.tick_instant(frame, now)
+        if self.auto.enabled and self.zone:
+            busy = self.thinking or self.listener.active or (self.card is not None and now - self.card_t < 2.0
+                                                             and not self.card_corner and self.mode != "find")
+            if self.auto.update(frame, self.zone_rect(), self.hand_centers, busy):
+                self.ask(frame, auto=True)
+
     # ---- drawing ------------------------------------------------------------
+    def _label_img(self, zh, en, color):
+        key = (zh, color)
+        if key not in self.label_cache:
+            self.label_cache[key] = ui.render_box_label(self.text, zh, chinese.pinyin(zh), en, color)
+        return self.label_cache[key]
+
     def render(self, frame, now, hold_info):
         out = frame.copy()
-        if self.frozen is not None:                        # the red box holds still until the answer
+        if self.frozen is not None:
             still, (fx, fy) = self.frozen
             h, w = still.shape[:2]
             out[fy:fy + h, fx:fx + w] = still
             if time.perf_counter() - self.frozen_t < 0.18:       # little camera-shutter flash
                 out[fy:fy + h, fx:fx + w] = cv2.addWeighted(still, 0.5, np.full_like(still, 255), 0.5, 0)
+        if self.detector.enabled:
+            for x0, y0, x1, y1, en, zh, conf in self.detector.boxes:
+                hot = self.point["box"] == zh
+                col = (0, 220, 255) if hot else (230, 230, 230)
+                cv2.rectangle(out, (int(x0), int(y0)), (int(x1), int(y1)), col, 3 if hot else 1, cv2.LINE_AA)
+                lab = self._label_img(zh, en, col)
+                blit(out, lab, int(x0), int(y0) - lab.shape[0] - 2)
+            if hot_t := (self.point["box"] and now - self.point["t"]):
+                c = tuple(int(v) for v in self.g["tip"]) if self.g else None
+                if c and hot_t < 0.9:
+                    cv2.ellipse(out, c, (24, 24), -90, 0, 360 * hot_t / 0.9, ACCENT, 4, cv2.LINE_AA)
         if self.zone:
             zx, zy, zw, zh = self.zone_rect()
             red = (40, 40, 235)
             cv2.rectangle(out, (zx, zy), (zx + zw, zy + zh), (20, 20, 20), 7, cv2.LINE_AA)
             cv2.rectangle(out, (zx, zy), (zx + zw, zy + zh), red, 4, cv2.LINE_AA)
-            tag = self.text.label("ASK ZONE" if self.lang == "en" else "حط الحاجة هنا", 22, (255, 255, 255))
-            round_rect(out, zx, zy - 38, zx + tag.shape[1] + 24, zy - 4, 12, red, 0.95)
-            blit(out, tag, zx + 12, zy - 36)
-        for (ax, ay), st in self.stickers:
-            blit(out, st, int(ax - st.shape[1] / 2), int(ay - st.shape[0]))
+            tag_txt = ("ASK ZONE" if self.lang == "en" else "حط الحاجة هنا") + ("  ·  AUTO" if self.auto.enabled else "")
+            tag = self.text.label(tag_txt, 22, (255, 255, 255))
+            round_rect(out, zx, max(0, zy - 38), zx + tag.shape[1] + 24, max(34, zy - 4), 12, red, 0.95)
+            blit(out, tag, zx + 12, max(2, zy - 36))
+            if self.auto.progress > 0:                          # "hold still..." ring
+                c = (zx + zw // 2, zy + zh // 2)
+                cv2.ellipse(out, c, (46, 46), -90, 0, 360, (60, 60, 60), 6, cv2.LINE_AA)
+                cv2.ellipse(out, c, (46, 46), -90, 0, 360 * self.auto.progress, ACCENT, 6, cv2.LINE_AA)
+        for st in self.board:
+            ax, ay = st.anchor
+            blit(out, st.img, int(ax - st.img.shape[1] / 2), int(ay - st.img.shape[0]), st.alpha)
+        chips = []
         if self.learn:
-            chip = self.text.label(f"LEARN  {LEARN_TAG[self.learn]}", 26, (255, 255, 255))
-            round_rect(out, 20, 20, 20 + chip.shape[1] + 30, 20 + 50, 25, self.ink, 0.9)
-            blit(out, chip, 35, 28)
+            chips.append(f"LEARN  {'中文' if self.learn == 'zh' else 'EN'}")
+        if self.mode == "read":
+            chips.append("READ  读")
+        if self.mode == "find":
+            chips.append("FIND  找")
+        if self.detector.enabled:
+            chips.append("INSTANT" if self.detector.model else
+                         f"INSTANT: {self.detector.error}" if self.detector.error else "INSTANT loading...")
+        if self.vocab:
+            chips.append(f"{self.vocab.count()} words")
+        x = 20
+        for ch in chips:
+            lab = self.text.label(ch, 22, (255, 255, 255))
+            round_rect(out, x, 20, x + lab.shape[1] + 24, 62, 21, self.ink if ch.startswith(("LEARN", "READ", "FIND"))
+                       else (60, 60, 60), 0.9)
+            blit(out, lab, x + 12, 26)
+            x += lab.shape[1] + 34
         for s in self.strokes:
             if len(s) > 1:
                 pts, closed = stroke_points(s)
@@ -1038,11 +852,12 @@ class AirMind:
         if self.speech_status and now - self.speech_status[1] < 6:
             msg = self.speech_status[0]
             col = (80, 80, 255) if "FAIL" in msg or "ERROR" in msg else (230, 230, 230)
-            lbl = self.text.label(msg, 22, col)
-            round_rect(out, 16, H - 92, 16 + lbl.shape[1] + 24, H - 52, 14, (16, 16, 18), 0.8)
-            blit(out, lbl, 28, H - 88)
+            lbl = self.text.label(msg[:60], 22, col)
+            sx = W - lbl.shape[1] - 40                          # bottom-right: out of the cards' way
+            round_rect(out, sx - 12, H - 92, sx + lbl.shape[1] + 12, H - 52, 14, (16, 16, 18), 0.8)
+            blit(out, lbl, sx, H - 88)
         if self.listener.active:
-            pill = self.text.label(self.ui["listening"], 28, (255, 255, 255))
+            pill = self.text.label(self.ui["say_it" if self.listen_purpose == "practice" else "listening"], 28, (255, 255, 255))
             pw = pill.shape[1] + 150
             x0, y0 = (W - pw) // 2, H - 150
             round_rect(out, x0, y0, x0 + pw, y0 + 64, 32, (16, 16, 18), 0.85)
@@ -1063,18 +878,22 @@ class AirMind:
             for k in range(3):
                 a = 0.35 + 0.65 * max(0, np.sin(now * 6 - k * 0.8))
                 cv2.circle(out, (dx + k * 20, y0 + 32), 6, tuple(int(c * a) for c in ACCENT), -1, cv2.LINE_AA)
-        elif self.card is not None:
+        if self.card is not None and not (self.thinking and self.mode != "find"):
             fade = min(1.0, (now - self.card_t) / 0.25)
-            ch = self.card.shape[0]
+            ch, cw = self.card.shape[:2]
             bx, by, bw, bh = self.band
-            y = by + bh + 40 if H > W else H - ch - 40   # story: right under the camera band
-            x = (W - self.card.shape[1]) // 2
-            if getattr(self, "card_corner", False):
-                age = now - self.card_t                   # word cards sit in the corner and fade after 7 s,
-                fade = min(fade, max(0.0, min(1.0, 8 - age)))   # leaving the sticker on the object
-                if W > H:                                 # keep clear of the red box
-                    x = 28 if self.zone == "right" else W - self.card.shape[1] - 28
-            if self.frozen is not None and getattr(self, "card_corner", False) and now - self.card_t > 8:
+            y = by + bh + 40 if H > W else H - ch - 40
+            x = (W - cw) // 2
+            if self.card_corner:
+                age = now - self.card_t                   # word cards fade, leaving the sticker on the object
+                fade = min(fade, max(0.0, min(1.0, self.card_life - age)))
+                if W > H:
+                    x = 28 if self.card_left else W - cw - 28
+                    y = H - ch - 110
+            elif W > H and (self.zone or self.mode):
+                x = 28 if self.card_left else W - cw - 28             # keep cards clear of the object / red box
+            y = max(70, min(y, H - ch - 10))
+            if self.frozen is not None and self.card_corner and now - self.card_t > self.card_life:
                 self.unfreeze()                           # answer gone -> the red box goes live again
             if fade > 0:
                 blit(out, self.card, x, y + int((1 - min(fade, 1)) * 30), fade)
@@ -1100,7 +919,7 @@ def finish_recording(rec):
         return
     dur = rec["frames"] / 30
     cmd = [ff, "-y", "-loglevel", "error", "-i", str(raw)]
-    clips = [(o, p) for o, p in rec["audio"] if o < dur]
+    clips = [(o, p) for o, p in rec["audio"] if o < dur and Path(p).exists()]
     for _, p in clips:
         cmd += ["-i", str(p)]
     if clips:
@@ -1135,13 +954,13 @@ def ensure_hand_model():
 
 
 def find_voice(locale_re, prefer=()):
+    import re
     if not shutil.which("say"):
         return None
     try:
         out = run_tool(["say", "-v", "?"]).stdout
     except Exception:
         return None
-    # lines look like "Samantha            en_US    # ..." or "Tingting (Chinese (China mainland)) zh_CN    # ..."
     names = []
     for ln in out.splitlines():
         m = re.match(r"^(.+?)\s+([a-z]{2,3}_[A-Za-z0-9]+)\s+#", ln.strip())
@@ -1155,12 +974,7 @@ def find_voice(locale_re, prefer=()):
 
 
 def compose(cam):
-    """Lay the camera frame onto the W x H canvas. Returns (canvas, camera_view, band).
-
-    Wide mode: the camera fills the canvas. Story mode (9:16): the WHOLE wide camera view sits
-    in a band across the canvas, over a blurred copy of itself, so nothing is cropped away and
-    there's room under it for the answer card. `band` = (x, y, w, h) of the live camera area.
-    """
+    """Lay the camera frame onto the W x H canvas. Returns (canvas, camera_view, band)."""
     h, w = cam.shape[:2]
     if W > H:
         view = cv2.resize(cam, (W, H), interpolation=cv2.INTER_LINEAR)
@@ -1178,34 +992,10 @@ def compose(cam):
     return canvas, view, (0, by, W, bh)
 
 
-def pick_hands(res, band, prefer, last):
-    """Returns (drawing_hand, command_hand). The drawing hand is the one that was just drawing,
-    otherwise your chosen hand (right/left); the other hand, if any, gives commands."""
-    if not res.hand_landmarks:
-        return None, None
-    bx, by, bw, bh = band
-    hands = []
-    for i, lms in enumerate(res.hand_landmarks):
-        pts = np.array([[bx + p.x * bw, by + p.y * bh] for p in lms], np.float32)
-        cat = res.handedness[i][0] if res.handedness and res.handedness[i] else None
-        # On the live (mirrored) camera MediaPipe's label comes out swapped: its "Left" is your right hand.
-        side = {"left": "right", "right": "left"}.get(cat.category_name.lower(), "") if cat else ""
-        hands.append((pts, side, cat.score if cat else 0.0))
-    if len(hands) == 1:
-        pts, side, _ = hands[0]
-        if prefer == "any" or side in ("", prefer) or last is not None:
-            return pts, None
-        return None, pts                                    # only your other hand is up: it can still command
-    if last is not None:                                    # keep following the hand we were on
-        draw = min(hands, key=lambda h: np.linalg.norm(h[0][[4, 8]].mean(axis=0) - last))
-    else:
-        mine = [h for h in hands if h[1] == prefer]
-        draw = max(mine or hands, key=lambda h: h[2])
-    other = next(h for h in hands if h is not draw)
-    return draw[0], other[0]
-
-
 def run(app, cam_index, prefer_hand="right"):
+    import mediapipe as mp
+    from mediapipe.tasks import python as mpt
+    from mediapipe.tasks.python import vision
     hands = vision.HandLandmarker.create_from_options(vision.HandLandmarkerOptions(
         base_options=mpt.BaseOptions(model_asset_path=ensure_hand_model()),
         running_mode=vision.RunningMode.VIDEO, num_hands=2,
@@ -1240,7 +1030,9 @@ def run(app, cam_index, prefer_hand="right"):
         res = hands.detect_for_video(mp.Image(image_format=mp.ImageFormat.SRGB,
                                               data=cv2.cvtColor(view, cv2.COLOR_BGR2RGB)), ts)
         hand, other = pick_hands(res, app.band, prefer_hand, app.cursor)
+        app.hand_centers = [h[[0, 5, 9, 13, 17]].mean(axis=0) for h in (hand, other) if h is not None]
         ev = app.update_hand(hand, dt, other)
+        app.tick(frame, now)
         hold_at = None
         if ev:
             fired, hold_at = ev
@@ -1248,8 +1040,6 @@ def run(app, cam_index, prefer_hand="right"):
                 app.ask(frame)
             elif fired == "clear":
                 app.clear()
-            elif fired == "listen":
-                app.toggle_listen()
         out = app.render(frame, now, hold_at)
 
         if app.rec:
@@ -1261,83 +1051,140 @@ def run(app, cam_index, prefer_hand="right"):
         view = out.copy()
         if now - t0 < 25 and not app.strokes and app.card is None:
             hint = app.text.label(app.ui["hint"], 22, (235, 235, 235))
-            blit(view, hint, (W - hint.shape[1]) // 2, 28)
+            blit(view, hint, (W - hint.shape[1]) // 2, 72)
         model = app.vlm.model if app.vlm else "no model"
         cv2.circle(view, (24, H - 26), 6, (90, 220, 120) if app.vlm else (60, 60, 230), -1, cv2.LINE_AA)
-        cv2.putText(view, f"{'SNAP  ' if app.snap else ''}{app.lang.upper()}  [L]  {Path(model).name[:34]}  {fps:4.1f} fps", (38, H - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (210, 210, 210), 1, cv2.LINE_AA)
+        cv2.putText(view, f"{'SNAP  ' if app.snap else ''}{app.lang.upper()}  [L]  {Path(model).name[:34]}  {fps:4.1f} fps",
+                    (38, H - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (210, 210, 210), 1, cv2.LINE_AA)
         if app.rec:
             cv2.circle(view, (W - 110, 34), 10, (0, 0, 255), -1, cv2.LINE_AA)
-            cv2.putText(view, f"REC {int(now - app.rec['start'])}s", (W - 92, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
+            cv2.putText(view, f"REC {int(now - app.rec['start'])}s", (W - 92, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                        (0, 0, 255), 2, cv2.LINE_AA)
         cv2.imshow(win, view)
 
         k = cv2.waitKey(1) & 0xFF
         if k in (ord("q"), 27):
             break
-        elif k == ord(" "):
-            app.ask(frame)
-        elif k == ord("c"):
-            app.clear()
-        elif k == ord("v"):
-            app.toggle_listen()
-        elif k == ord("t"):
-            app.cycle_learn()
-        elif k == ord("k"):
-            app.ink_i = (app.ink_i + 1) % len(INKS)
-        elif k == ord("x"):
-            app.stickers = []
-        elif k == ord("g"):
-            app.snap = not app.snap
-        elif k == ord("z"):
-            app.cycle_zone()
-        elif k == ord("p"):
-            app.replay()
-        elif k == ord("m"):
-            app.muted = not app.muted
-        elif k == ord("f"):
+        if not handle_key(app, k, frame, out, now):
+            continue
+        if k == ord("f"):
             full = not full
             cv2.setWindowProperty(win, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN if full else cv2.WINDOW_NORMAL)
         elif k == ord("l"):
-            app.set_lang("en" if app.lang == "ar" else "ar")
-            app.card = None
             t0 = now - 20   # flash the hint in the new language for a few seconds
-        elif k == ord("s"):
-            p = OUT_DIR / f"airmind_{time.strftime('%H%M%S')}.png"
-            cv2.imwrite(str(p), out)
-            print("Saved", p)
-        elif k == ord("r"):
-            if app.rec is None:
-                stamp = time.strftime("%H%M%S")
-                raw_path = app.tmp / f"raw_{stamp}.mp4"
-                wr = open_writer(raw_path)
-                if wr:
-                    app.rec = dict(writer=wr, start=now, frames=0, audio=[], raw=raw_path,
-                                   final=OUT_DIR / f"airmind_{stamp}.mp4")
-                    print("Recording ...")
-            else:
-                rec, app.rec = app.rec, None
-                threading.Thread(target=finish_recording, args=(rec,)).start()
     if app.rec:
         finish_recording(app.rec)
     cap.release()
     cv2.destroyAllWindows()
 
 
+def handle_key(app, k, frame, out, now):
+    """All keyboard actions except window ones. Returns True when the key was something."""
+    if k == 255:
+        return False
+    c = chr(k) if k < 128 else ""
+    if c == " ":
+        app.ask(frame)
+    elif c == "c":
+        app.clear()
+    elif c == "v":
+        app.toggle_listen("ask")
+    elif c == "y":
+        app.toggle_listen("practice")
+    elif c == "t":
+        app.cycle_learn()
+    elif c == "o":
+        app.toggle_mode("read")
+        if app.mode == "read" and not ocr.available():
+            print("Tip: pip install ocrmac  (Apple's OCR reads Chinese labels much better)", flush=True)
+    elif c == "h":
+        app.toggle_mode("find")
+    elif c == "i":
+        on = app.detector.toggle()
+        if on and not app.detector.installed():
+            app.info("pip install ultralytics", "error")
+    elif c == "a":
+        app.auto.enabled = not app.auto.enabled
+        app.auto.forget()
+    elif c in "123":
+        app.choose(int(c) - 1)
+    elif c == "n":
+        app.export_notebook()
+    elif c == "k":
+        app.ink_i = (app.ink_i + 1) % len(INKS)
+    elif c == "x":
+        app.board.clear()
+    elif c == "g":
+        app.snap = not app.snap
+    elif c == "z":
+        app.cycle_zone()
+    elif c == "p":
+        app.replay()
+    elif c == "m":
+        app.muted = not app.muted
+    elif c == "l":
+        app.set_lang("en" if app.lang == "ar" else "ar")
+        app.card = None
+    elif c == "s":
+        p = OUT_DIR / f"airmind_{time.strftime('%H%M%S')}.png"
+        cv2.imwrite(str(p), out)
+        print("Saved", p)
+    elif c == "r":
+        if app.rec is None:
+            stamp = time.strftime("%H%M%S")
+            raw_path = app.tmp / f"raw_{stamp}.mp4"
+            wr = open_writer(raw_path)
+            if wr:
+                app.rec = dict(writer=wr, start=now, frames=0, audio=[], raw=raw_path,
+                               final=OUT_DIR / f"airmind_{stamp}.mp4")
+                print("Recording ...")
+        else:
+            rec, app.rec = app.rec, None
+            threading.Thread(target=finish_recording, args=(rec,)).start()
+    return True
+
+
+def learn_from_image(vlm, path, target="zh"):
+    """--learn-image: the whole word pipeline on one photo, no camera (handy for testing a model)."""
+    img = cv2.imread(path)
+    if img is None:
+        sys.exit(f"Can't read {path}")
+    k = 512 / max(img.shape[:2])
+    img = cv2.resize(img, None, fx=k, fy=k, interpolation=cv2.INTER_AREA)
+    jpeg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 90])[1].tobytes()
+    t = time.perf_counter()
+    raw = vlm.ask_learn(jpeg, False, target, focus=True)
+    cands, ex, ex_tr = parse_learn(raw)
+    print(f"answered in {time.perf_counter() - t:.1f}s\nraw: {raw}")
+    for c in cands:
+        v = chinese.verify(c["word"]) if target == "zh" else {}
+        print(f"  {c['word']:<8} {v.get('pinyin', ''):<14} conf {c['confidence']:.2f}  "
+              f"dict: {'yes' if v.get('found') else 'NO'}  {v.get('en_dict') or c['en']}  HSK {v.get('hsk') or '-'}")
+    best = chinese.best_candidate(cands) if target == "zh" else (cands[0] if cands else None)
+    print("chosen:", best and best["word"], "| example:", ex, "|", chinese.sentence_pinyin(ex), "|", ex_tr)
+
+
 def main():
+    global W, H
     ap = argparse.ArgumentParser(description="AirMind: draw in the air, a local AI answers")
     ap.add_argument("--model", help="part of the model name to use (default: best vision model found)")
     ap.add_argument("--lang", choices=["ar", "en"], default="ar", help="answer language (press L while running to switch)")
     ap.add_argument("--voice", help="macOS voice name (default: an Arabic voice if installed)")
     ap.add_argument("--cam", type=int, default=0)
     ap.add_argument("--hand", choices=["right", "left", "any"], default="right",
-                    help="the hand you draw with; the other hand is ignored (default right)")
+                    help="the hand you draw with; the other hand gives commands (default right)")
     ap.add_argument("--story", action="store_true", help="vertical 9:16 output for Instagram stories (default: wide 16:9)")
     ap.add_argument("--mute", action="store_true")
     ap.add_argument("--stt", default="base", help="speech model: tiny | base | small | off  (default base, ~145 MB)")
+    ap.add_argument("--learn", choices=["zh", "en"], help="start in learn mode")
+    ap.add_argument("--auto", action="store_true", help="start with auto-ask on (hold an object still in the red box)")
     ap.add_argument("--list", action="store_true", help="list the models found and exit")
     ap.add_argument("--ask-image", help="send a photo to the model once and print the answer (test without camera)")
+    ap.add_argument("--learn-image", help="run the Chinese word pipeline on a photo and print it (test without camera)")
     a = ap.parse_args()
-    global W, H
     W, H = (720, 1280) if a.story else (1280, 720)
+    ui.SIZE[:] = [W, H]
+    chinese.preload()
 
     found = discover_models()
     if a.list:
@@ -1353,21 +1200,24 @@ def main():
         print(f"Using {vlm.model} via {vlm.backend}")
         threading.Thread(target=vlm.warm_up, daemon=True).start()
     elif found:
-        print("Found models, but none looks like a vision model. Get one with:  ollama pull qwen2.5vl:7b")
+        print("Found models, but none looks like a vision model. Get one with:  ollama pull qwen3-vl:4b")
         print("Or force one with --model NAME. Found:", ", ".join(f[2] for f in found))
     else:
         print("No local AI server found. Start Ollama (or LM Studio's server) and run again.")
 
-    if a.ask_image:
+    if a.ask_image or a.learn_image:
         if not vlm:
             sys.exit(1)
+        if a.learn_image:
+            learn_from_image(vlm, a.learn_image, a.learn or "zh")
+            return
         img = cv2.imread(a.ask_image)
         k = 1024 / max(img.shape[:2])
         if k < 1:
             img = cv2.resize(img, None, fx=k, fy=k, interpolation=cv2.INTER_AREA)
-        ok, jpeg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 88])
+        jpeg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 88])[1].tobytes()
         t = time.perf_counter()
-        raw = vlm.ask(jpeg.tobytes(), False)
+        raw = vlm.ask(jpeg, False)
         print(f"answered in {time.perf_counter() - t:.1f}s")
         print(raw, "\n->", parse_reply(raw))
         return
@@ -1382,9 +1232,15 @@ def main():
         print("No Arabic voice installed: System Settings > Accessibility > Spoken Content > System Voice > Manage Voices > Arabic")
     print("AirMind version:", VERSION, flush=True)
     print("Voices:", voices, flush=True)
-    app = AirMind(vlm, a.lang, voices, a.mute)
+    print("Apple OCR:", "yes" if ocr.available() else "no (pip install ocrmac)",
+          "| Instant mode:", "yes" if InstantDetector.installed() else "no (pip install ultralytics)", flush=True)
+    vocab = Vocab()
+    print(f"Notebook: {vocab.count()} words in {vocab.root}", flush=True)
+    app = AirMind(vlm, a.lang, voices, a.mute, vocab)
+    app.learn = a.learn
+    app.auto.enabled = a.auto
     app.stt = SpeechToText(a.stt) if a.stt != "off" else None
-    if not a.mute:   # voice check: you should hear this right away
+    if not a.mute:
         app.speak("Ready" if a.lang == "en" else "جاهز")
     run(app, a.cam, a.hand)
 

@@ -123,6 +123,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         data = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         job = {k: data.get(k) for k in ("text", "voice", "rate", "file")}
+        job["play"] = data.get("play", True) is not False        # False: only write the file (notebook audio)
         done = {"event": threading.Event(), "ok": False}
         jobs.put((job, done))
         done["event"].wait(90)

@@ -6,7 +6,9 @@
 MODEL_DIR="$HOME/.lmstudio/models/lmstudio-community/gemma-4-26B-A4B-it-GGUF"
 MODEL="$MODEL_DIR/gemma-4-26B-A4B-it-Q4_K_M.gguf"
 MMPROJ="$MODEL_DIR/mmproj-gemma-4-26B-A4B-it-BF16.gguf"
-VENV="$HOME/Documents/AI/haunted-cam/.venv"
+# the project's own Python environment (made by ./setup.sh); the old haunted-cam one still works as a fallback
+VENV="$(cd "$(dirname "$0")" && pwd)/.venv"
+[ -d "$VENV" ] || VENV="$HOME/Documents/AI/haunted-cam/.venv"
 # How many of the model's layers keep their "experts" on the CPU. Lower = faster answers but more
 # GPU memory; too low and macOS audio can stop. 12 is safe, 8 tested OK; try 6 or 4:  CPU_MOE=4 ./start.sh
 CPU_MOE="${CPU_MOE:-8}"
@@ -26,16 +28,22 @@ fi
 # 2) start the model. Two choices:
 #    - default: Gemma 4 26B through llama-server (big, smart, slower on 24 GB)
 #    - FAST=1:  a small vision model through Ollama (much faster; download once with
-#               `ollama pull qwen2.5vl:3b`). Pick another with OLLAMA_MODEL=name
+#               `ollama pull qwen3-vl:4b` or `ollama pull qwen3-vl:2b`). Pick one with OLLAMA_MODEL=name
 SERVER_PID=""
 APP_ARGS=()
 if [ -n "$FAST" ] || [ -n "$OLLAMA_MODEL" ]; then
-  OLLAMA_MODEL="${OLLAMA_MODEL:-qwen2.5vl:3b}"
+  # pick with OLLAMA_MODEL=name; otherwise the best one you have (run `python bench.py` to compare them)
   if ! curl -s http://127.0.0.1:11434/api/tags >/dev/null; then
     echo "Starting Ollama..."
     ollama serve > /tmp/ollama.log 2>&1 &
     SERVER_PID=$!
     until curl -s http://127.0.0.1:11434/api/tags >/dev/null; do sleep 1; done
+  fi
+  if [ -z "$OLLAMA_MODEL" ]; then            # the best small vision model you have downloaded
+    for m in qwen3-vl:4b qwen3-vl:2b qwen2.5vl:3b; do
+      if ollama list | grep -q "^$m"; then OLLAMA_MODEL=$m; break; fi
+    done
+    OLLAMA_MODEL="${OLLAMA_MODEL:-qwen2.5vl:3b}"
   fi
   if ! ollama list | grep -q "^${OLLAMA_MODEL%%:*}"; then
     echo "Model $OLLAMA_MODEL isn't downloaded yet. Run:  ollama pull $OLLAMA_MODEL"; exit 1

@@ -1,0 +1,2 @@
+# Optional INSTANT mode (key I): live Chinese labels on everything. Big download (PyTorch, ~1 GB).
+ultralytics

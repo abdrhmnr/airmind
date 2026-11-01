@@ -1,9 +1,16 @@
+# camera, hands, drawing
 mediapipe
-opencv-contrib-python
+opencv-contrib-python      # contrib: CSRT tracker that keeps stickers on the objects
 numpy
 pillow
-sympy
 arabic-reshaper
 python-bidi
 certifi
+# answers
+sympy                      # exact math
+pypinyin                   # pinyin + tones computed, not guessed by the model
+genanki                    # notebook -> Anki deck
+ocrmac                     # Apple Vision OCR (READ mode, macOS only)
+# voice
 faster-whisper
+sounddevice
