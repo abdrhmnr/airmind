@@ -1,0 +1,9 @@
+mediapipe
+opencv-contrib-python
+numpy
+pillow
+sympy
+arabic-reshaper
+python-bidi
+certifi
+faster-whisper
