@@ -139,6 +139,38 @@ CHECK_SCHEMA = {"type": "object", "properties": {"match": {"type": "boolean"}, "
                 "required": ["match", "seen"]}
 
 
+LINES_SYSTEM = """You translate text found in a photo (a menu, a food label, a sign, a package) line by line.
+Each input line has a number. For EVERY line give a short translation into Egyptian Arabic ("ar") and English
+("en") that fits in about the same space (menu style, no explanations). Keep numbers, prices and brand names.
+Return one item per input line with the same "i"."""
+LINES_SCHEMA = {"type": "object", "properties": {"items": {"type": "array", "items": {"type": "object", "properties": {
+    "i": {"type": "integer"}, "ar": {"type": "string"}, "en": {"type": "string"}}, "required": ["i", "ar", "en"]}}},
+    "required": ["items"]}
+
+HANZI_SYSTEM = """The picture shows Chinese handwriting drawn in black on white by a beginner with a finger in
+the air, so the strokes are wobbly and may be out of proportion. Which Chinese character (or 2-3 characters) is it?
+Give up to 3 candidates, best first, simplified characters only, with an honest confidence 0-1, plus the meaning in
+English ("en") and Egyptian Arabic ("ar")."""
+HANZI_SCHEMA = {"type": "object", "properties": {"candidates": {"type": "array", "minItems": 1, "maxItems": 3,
+    "items": {"type": "object", "properties": {"text": {"type": "string"}, "en": {"type": "string"},
+                                               "ar": {"type": "string"}, "confidence": {"type": "number"}},
+              "required": ["text", "en", "ar", "confidence"]}}}, "required": ["candidates"]}
+
+INTERPRET_SYSTEM = """You are a live interpreter between a speaker of Egyptian Arabic or English and a speaker of
+Mandarin Chinese. Translate the sentence into {target}: natural, spoken, short, same meaning and tone, no notes.
+{extra}"""
+INTERPRET_SCHEMA = {"type": "object", "properties": {"translation": {"type": "string"}}, "required": ["translation"]}
+
+STORY_SYSTEM = """Write a very short, funny story for a beginner learner of Chinese (HSK 1-2 words only) in
+simplified Chinese. It MUST use every one of these words: {words}.
+3 or 4 sentences, each at most 14 characters. Give each sentence in Chinese ("zh"), Egyptian Arabic ("ar") and
+English ("en"), and a short title in Chinese ("title")."""
+STORY_SCHEMA = {"type": "object", "properties": {"title": {"type": "string"}, "sentences": {"type": "array",
+    "minItems": 2, "maxItems": 5, "items": {"type": "object", "properties": {
+        "zh": {"type": "string"}, "ar": {"type": "string"}, "en": {"type": "string"}},
+        "required": ["zh", "ar", "en"]}}}, "required": ["title", "sentences"]}
+
+
 def learn_system(target):
     return LEARN_SYSTEM.format(lang=LEARN_LANGS[target], rule=LEARN_RULE[target],
                                tr="English" if target == "zh" else "Arabic")
@@ -208,16 +240,33 @@ class LocalVLM:
         return self.chat(CHECK_SYSTEM, f'The learner was asked to show: "{en}" ({word}). Is that what the photo shows?',
                          jpeg, CHECK_SCHEMA, temperature=0.0, max_tokens=60)
 
+    def translate_lines(self, lines):
+        numbered = "\n".join(f"{i}. {ln}" for i, ln in enumerate(lines))
+        return self.chat(LINES_SYSTEM, numbered, None, LINES_SCHEMA, temperature=0.1, max_tokens=60 + 60 * len(lines))
+
+    def read_hanzi(self, jpeg):
+        return self.chat(HANZI_SYSTEM, "Which character did I write?", jpeg, HANZI_SCHEMA, temperature=0.1, max_tokens=200)
+
+    def interpret(self, text, target):
+        names = {"zh": "simplified Chinese (Mandarin)", "ar": "Egyptian Arabic", "en": "English"}
+        extra = "Use simplified characters." if target == "zh" else ""
+        return self.chat(INTERPRET_SYSTEM.format(target=names[target], extra=extra), text, None, INTERPRET_SCHEMA,
+                         temperature=0.2, max_tokens=200)
+
+    def story(self, words):
+        return self.chat(STORY_SYSTEM.format(words="、".join(words)), "Write the story.", None, STORY_SCHEMA,
+                         temperature=0.8, max_tokens=500)
+
     # ---- transport ---------------------------------------------------------------------------
     def chat(self, system, prompt, jpeg, schema=None, temperature=0.4, max_tokens=260, history=None):
         """history: [(user_prompt, assistant_reply)] of earlier turns about the same picture (follow-ups)."""
-        b64 = base64.b64encode(jpeg).decode()
+        b64 = base64.b64encode(jpeg).decode() if jpeg else None      # jpeg=None: a text-only question
         if self.backend == "ollama":
             msgs = [{"role": "system", "content": system}]
             turns = list(history or []) + [(prompt, None)]
             for i, (u, a) in enumerate(turns):
                 m = {"role": "user", "content": u}
-                if i == 0:
+                if i == 0 and b64:
                     m["images"] = [b64]
                 msgs.append(m)
                 if a is not None:
@@ -253,7 +302,7 @@ class LocalVLM:
         turns = list(history or []) + [(prompt, None)]
         for i, (u, a) in enumerate(turns):
             content = [{"type": "text", "text": u}]
-            if i == 0:
+            if i == 0 and b64:
                 content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
             msgs.append({"role": "user", "content": content})
             if a is not None:

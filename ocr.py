@@ -41,3 +41,33 @@ def read_text(bgr, min_conf=0.3):
     lines = [(t, box) for t, conf, box in res if conf >= min_conf and t.strip()]
     lines.sort(key=lambda tb: (-(tb[1][1] + tb[1][3]), tb[1][0]))   # Vision boxes start bottom-left
     return "\n".join(t for t, _ in lines)
+
+
+def read_lines(bgr, min_conf=0.3):
+    """Text lines with their place: [(text, (x, y, w, h) in pixels of `bgr`)], top to bottom.
+    None when OCR isn't available."""
+    if not available():
+        return None
+    from PIL import Image
+    from ocrmac import ocrmac
+    H, W = bgr.shape[:2]
+    big = bgr
+    if max(H, W) < 900:
+        k = 900 / max(H, W)
+        big = cv2.resize(bgr, None, fx=k, fy=k, interpolation=cv2.INTER_CUBIC)
+    img = Image.fromarray(cv2.cvtColor(big, cv2.COLOR_BGR2RGB))
+    try:
+        try:
+            res = ocrmac.OCR(img, recognition_level="accurate", language_preference=["zh-Hans", "en-US"]).recognize()
+        except TypeError:
+            res = ocrmac.OCR(img, recognition_level="accurate").recognize()
+    except Exception as e:
+        print("OCR failed:", e, flush=True)
+        return None
+    out = []
+    for text, conf, (nx, ny, nw, nh) in res:          # normalized, origin at the BOTTOM-left
+        if conf < min_conf or not text.strip():
+            continue
+        out.append((text.strip(), (int(nx * W), int((1 - ny - nh) * H), max(1, int(nw * W)), max(1, int(nh * H)))))
+    out.sort(key=lambda t: (t[1][1], t[1][0]))
+    return out

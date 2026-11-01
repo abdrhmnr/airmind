@@ -352,3 +352,107 @@ def render_box_label(text_r, zh, py, en, color):
     """Small live label for INSTANT mode boxes."""
     return build_card(text_r, [{"segs": tone_segs(zh, 30), "h": 38}, {"segs": [(py, 16, ACCENT)], "h": 20}],
                       max(110, int(text_r.font(30, zh).getlength(zh)) + 40), pad=8, alpha=200, border=color)
+
+
+# --------------------------------------------------------------------------- 1) lens: translation on top of the text
+def draw_lens(out, text_r, items):
+    """items: [(x, y, w, h, translated_text, level)] in canvas pixels. Each line of the menu / label gets its
+    translation painted right on top of it, sized to fit."""
+    H, W = out.shape[:2]
+    for x, y, w, h, tr, level in items:
+        if not tr:
+            continue
+        size = int(np.clip(h * 0.85, 14, 44))
+        lab = text_r.label(tr, size, (255, 255, 255))
+        while lab.shape[1] > w * 1.15 + 20 and size > 14:
+            size -= 2
+            lab = text_r.label(tr, size, (255, 255, 255))
+        bw, bh = max(w, lab.shape[1] + 12), max(h, lab.shape[0] + 4)
+        bx = int(np.clip(x + w / 2 - bw / 2, 0, W - bw))
+        by = int(np.clip(y + h / 2 - bh / 2, 0, H - bh))
+        col = {"haram": (40, 40, 200), "doubtful": (20, 120, 210)}.get(level, (24, 24, 26))
+        round_rect(out, bx, by, bx + int(bw), by + int(bh), min(10, int(bh) // 2), col, 0.9)
+        if level:
+            cv2.rectangle(out, (bx, by), (bx + int(bw), by + int(bh)), (255, 255, 255), 1, cv2.LINE_AA)
+        blit(out, lab, bx + (int(bw) - lab.shape[1]) // 2, by + (int(bh) - lab.shape[0]) // 2 + 2)
+
+
+# --------------------------------------------------------------------------- 2) air calligraphy result
+def render_hanzi_card(text_r, char, alts, score, mine, ref, ar, en):
+    """mine / ref: BGR thumbnails (your strokes, the real character)."""
+    cw, pad = min(SIZE[0] - 48, 520), 22
+    rows = [{"segs": [("写一写 WRITE", 20, ACCENT)]},
+            {"segs": tone_segs(char, 76), "h": 94},
+            {"segs": pinyin_segs(char, 30), "h": 44}]
+    if en:
+        rows.append({"segs": [(en, 22, (225, 225, 230))]})
+    if ar:
+        rows.append({"segs": [(ar, 24, (225, 225, 230))]})
+    if score is not None:
+        pct = int(np.clip((score - 0.15) / 0.5, 0, 1) * 100)
+        rows.append({"segs": [("match  ", 20, GREY), (f"{pct}%", 30, GREEN if pct >= 70 else ORANGE)]})
+    if len(alts) > 1:
+        rows.append({"segs": [("or: " + "   ".join(alts[1:]), 20, GREY)]})
+    card = build_card(text_r, rows, cw, pad)
+    # pictures strip: your writing | the real one
+    t = mine.shape[0]
+    strip = np.zeros((t + 50, cw, 4), np.uint8)
+    strip[..., :3], strip[..., 3] = (16, 16, 18), 218
+    gap = (cw - 2 * t) // 3
+    for i, (img, lbl) in enumerate(((mine, "you"), (ref, "real"))):
+        x = gap + i * (t + gap)
+        strip[8:8 + t, x:x + t, :3] = img
+        strip[8:8 + t, x:x + t, 3] = 255
+        cv2.putText(strip, lbl, (x + t // 2 - 18, t + 36), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200, 255), 1,
+                    cv2.LINE_AA)
+    return np.vstack([card[:-14], strip, card[-14:]])
+
+
+# --------------------------------------------------------------------------- 3) interpreter subtitles
+def render_subtitle(text_r, heard, said, py, direction):
+    """Big two-line subtitle: what was said (small) and the translation (big)."""
+    cw, pad = min(SIZE[0] - 60, 1100), 26
+    inner = cw - 2 * pad
+    big = 46 if chinese.has_han(said) else 40
+    rows = [{"segs": [(direction, 20, ACCENT)]}]
+    rows += _wrapped(text_r, heard, 22, GREY, inner)
+    for ln in text_r.wrap(said, big, inner):
+        rows.append({"segs": tone_segs(ln, big) if chinese.has_han(ln) else [(ln, big, (255, 255, 255))],
+                     "h": int(big * 1.3)})
+    rows += _wrapped(text_r, py, 22, (200, 160, 220), inner)
+    return build_card(text_r, rows, cw, pad, alpha=230)
+
+
+# --------------------------------------------------------------------------- 4) story karaoke
+def _story_segs(text, size, words, bright):
+    """A Chinese sentence: your words in gold, the rest in tone colors (bright) or grey (not its turn yet)."""
+    out, i = [], 0
+    while i < len(text):
+        w = next((w for w in sorted(words, key=len, reverse=True) if text.startswith(w, i)), None)
+        if w:
+            out.append((w, size, (0, 215, 255) if bright else (90, 160, 190)))
+            i += len(w)
+            continue
+        ch = text[i]
+        if bright and chinese.has_han(ch):
+            t = chinese.tones(ch)
+            out.append((ch, size, chinese.TONE_COLORS.get(t[0] if t else 5, (255, 255, 255))))
+        else:
+            out.append((ch, size, (235, 235, 235) if bright else (120, 120, 125)))
+        i += 1
+    return out
+
+
+def render_story_card(text_r, story, cur, lang):
+    cw, pad = min(SIZE[0] - 48, 760), 24
+    inner = cw - 2 * pad
+    rows = [{"segs": [("故事 STORY  ", 20, ACCENT), (story.get("title", ""), 24, (255, 255, 255))]},
+            {"segs": [("  ·  ".join(story["words"]), 20, (0, 215, 255))]}]
+    for k, s in enumerate(story["sentences"]):
+        now = (k == cur) or cur < 0
+        rows.append({"segs": _story_segs(s["zh"], 34 if k == cur else 28, story["words"], now),
+                     "h": 48 if k == cur else 40})
+        if k == cur or cur < 0:
+            rows += _wrapped(text_r, chinese.sentence_pinyin(s["zh"]), 18, (200, 160, 220), inner)
+            rows += _wrapped(text_r, s.get("ar") if lang == "ar" else s.get("en"), 20, (215, 215, 220), inner)
+    return build_card(text_r, rows, cw, pad, border=(0, 215, 255) if cur >= 0 else None)

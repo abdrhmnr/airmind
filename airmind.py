@@ -12,6 +12,10 @@ Modes
   O  read text (menus, labels, signs) + halal check of ingredients
   H  "find it" review game from your notebook
   I  instant labels on everything (needs: pip install ultralytics)
+  W  write a Chinese character in the air (calligraphy brush) -> recognized, spoken, scored
+  B  interpreter: speak Arabic/English -> Chinese subtitles + voice, and back
+  U  a short story with the last words you learned, read aloud karaoke-style
+  O  (READ) now paints the translation right on top of each line of the menu / label
 
 Keys: 1/2/3 pick another candidate | Y say it (pronunciation check) | N notebook -> Anki | A auto-ask
       P say again | Z red box right/left/off | G shape snapping | K ink | X remove stickers
@@ -37,6 +41,7 @@ import cv2
 import numpy as np
 
 import chinese
+import hanzi
 import ocr
 import ui
 from audio import Listener, SpeechToText
@@ -49,7 +54,7 @@ from vlm import (LocalVLM, discover_models, http_json, is_vision, parse_json, pa
                  pick_model)
 from vocab import Vocab
 
-VERSION = "2026-11-01 learn-pro"
+VERSION = "2026-11-01 wow"
 W, H = 1280, 720
 HERE = Path(__file__).resolve().parent
 MODEL_DIR = HERE / "models"
@@ -77,7 +82,10 @@ UI = {
            "no_words": "لسه ما اتعلمتش كلمات. اضغط T واعمل دايرة حوالين حاجة الأول",
            "no_word": "اتعلم كلمة الأول (T)، وبعدين اضغط Y عشان تتمرن على نطقها",
            "haram": "خلي بالك: المكونات فيها خنزير أو كحول", "doubtful": "انتبه: فيه مكونات مش واضح إنها حلال",
-           "halal": "عليها علامة حلال", "right": "صح", "wrong": "لا، دي"},
+           "halal": "عليها علامة حلال", "right": "صح", "wrong": "لا، دي",
+           "write_first": "اكتب حرف صيني في الهوا الأول (لِم صوابعك وارسم)، وبعدين لايك",
+           "need_words": "اتعلم كلمتين على الأقل الأول (T وبعدين اعمل دايرة حوالين حاجتين)",
+           "no_text": "مش لاقي كلام مكتوب. قرّب الورقة وخليها مستوية"},
     "en": {"thinking": "thinking", "hint": "pinch to draw   •   thumbs up = ask   •   fist = clear",
            "ask": "ASK", "clear": "CLEAR", "listen": "TALK", "answer": "The answer is",
            "no_server": "Start Ollama or LM Studio first",
@@ -86,7 +94,10 @@ UI = {
            "no_words": "No words yet. Press T and circle something first",
            "no_word": "Learn a word first (T), then press Y to practice saying it",
            "haram": "Careful: this contains pork or alcohol", "doubtful": "Check this: some ingredients may not be halal",
-           "halal": "It has a halal mark", "right": "Right", "wrong": "No, that's"},
+           "halal": "It has a halal mark", "right": "Right", "wrong": "No, that's",
+           "write_first": "Write a Chinese character in the air first (pinch and draw), then thumbs up",
+           "need_words": "Learn at least two words first (T, then circle two things)",
+           "no_text": "I can't find any text. Hold it closer and flat"},
 }
 
 
@@ -152,7 +163,7 @@ class AirMind:
         self.speech_q, self.speech_status, self.last_spoken = queue.Queue(), None, []
         threading.Thread(target=self._speech_loop, daemon=True).start()
         self.ink_i, self.learn = 0, None                         # learn: None | "zh" | "en"
-        self.mode = None                                         # None | "read" | "find"
+        self.mode = None                                         # None | read | find | write | interpret
         self.board, self.pending_stickers = StickerBoard(), queue.Queue()
         self.frames, self.auto = FrameBuffer(), AutoCapture()
         self.detector = InstantDetector()
@@ -169,6 +180,10 @@ class AirMind:
         self.thinking, self.card, self.card_t, self.card_corner, self.card_life = False, None, 0.0, False, 8.0
         self.cursor, self.g, self.hand_centers = None, None, []
         self.card_left = True
+        self.lens = None                                         # translations painted over the text (READ)
+        self.session_words = []                                  # Chinese words learned since start (for stories)
+        self.story = None
+        self.interp_auto = True                                  # interpreter: listen again after each line
         self.rec = None
         self.tmp = Path(tempfile.mkdtemp(prefix="airmind_"))
         self.say_n = 0
@@ -199,11 +214,16 @@ class AirMind:
 
     def toggle_mode(self, mode):
         self.mode = None if self.mode == mode else mode
-        self.card = None
+        self.card, self.lens = None, None
+        self.unfreeze()
         if self.mode == "find":
             self.next_find()
         else:
             self.find = None
+        if self.mode == "write":
+            self.strokes = []
+        if self.mode == "interpret" and not self.listener.active:
+            self.toggle_listen("interpret")
 
     def set_lang(self, lang):
         self.lang, self.ui, self.voice = lang, UI[lang], self.voices.get(lang)
@@ -252,9 +272,9 @@ class AirMind:
 
     def end_stroke(self):
         if self.drawing and self.cur is not None and self.strokes and self.strokes[-1] is self.cur:
-            if len(self.cur) < 3 or stroke_size(self.cur) < MIN_STROKE:
+            if len(self.cur) < 2 or stroke_size(self.cur) < (6 if self.mode == "write" else MIN_STROKE):
                 self.strokes.pop()                     # fingers holding an object, not a drawing
-            elif self.snap:
+            elif self.snap and self.mode != "write":   # no shape snapping while writing characters
                 shape = snap_shape(self.cur)
                 if shape is not None:
                     self.strokes[-1] = shape
@@ -264,7 +284,7 @@ class AirMind:
         self.filter.reset()
 
     def clear(self):
-        self.strokes, self.card = [], None
+        self.strokes, self.card, self.lens, self.story = [], None, None, None
         self.board.clear()
         self.auto.forget()
         self.unfreeze()
@@ -312,8 +332,11 @@ class AirMind:
 
     def _transcribe_then_act(self, audio, purpose):
         try:
+            lang = None
             if purpose == "practice":
                 text, _ = self.stt.transcribe(audio, force="zh")
+            elif purpose == "interpret":
+                text, lang = self.stt.transcribe(audio, allowed=("ar", "en", "zh"))
             else:
                 allowed = ("zh", "ar", "en") if self.learn == "zh" else ("ar", "en")
                 text, lang = self.stt.transcribe(audio, allowed=allowed)
@@ -322,6 +345,13 @@ class AirMind:
         self.thinking = False
         if purpose == "practice":
             self.check_pronunciation(text or "")
+            return
+        if purpose == "interpret":
+            if text:
+                self.thinking = True
+                self._guard(self._interpret, {"text": text, "lang": lang})
+            else:
+                self.info(self.ui["didnt_hear"], "error")
             return
         if not text:
             self.info(self.ui["didnt_hear"] if self.stt.model else f"Speech: {self.stt.error}", "error")
@@ -373,6 +403,15 @@ class AirMind:
         if self.vlm is None:
             self.info(self.ui["no_server"], "error")
             return
+        if self.mode == "write" and not question:
+            if not any(len(s) > 1 for s in self.strokes):
+                self.info(self.ui["write_first"], "error")
+                return
+            self.thinking, self.card = True, None
+            job = {"strokes": [np.asarray(s, np.float32) for s in self.strokes if len(s) > 1]}
+            threading.Thread(target=self._guard, args=(self._hanzi_worker, job), daemon=True).start()
+            return
+        self.lens = None
         (rx, ry, rw, rh), strokes, box = self._region()
         has_strokes = bool(strokes)
         self.card_left = rx + rw / 2 > W / 2                    # put the answer on the other side of the object
@@ -393,7 +432,7 @@ class AirMind:
                   and not has_strokes and self.mode is None)
         self.thinking, self.card = True, None
         job = dict(jpeg=jpeg, has_strokes=has_strokes, focus=focus, question=question, clean=clean,
-                   box=box, frame=base)
+                   box=box, frame=base, origin=(rx, ry))
         if follow:
             job["jpeg"] = self.context["jpeg"]             # same picture as before
             target = self._tutor_worker if self.context["kind"] in ("learn", "tutor") else self._ask_worker
@@ -491,6 +530,8 @@ class AirMind:
         self.card_t, self.card_corner = time.perf_counter(), True
         self.card_life = 14.0 if len(info["alts"]) > 1 else 8.0
         w, target = info["word"], info["target"]
+        if target == "zh":
+            self._remember_word(w, job.get("replaced"))
         sticker = render_sticker(self.text, w, info.get("pinyin", ""), self.ink)
         if new and job.get("box") is not None:
             self.pending_stickers.put((sticker, job["box"], job["frame"]))
@@ -559,6 +600,14 @@ class AirMind:
 
     # ---- 4) read text + halal check ------------------------------------------------
     def _read_worker(self, job):
+        lines = ocr.read_lines(job["clean"]) if job.get("clean") is not None else None
+        if lines:
+            self._lens(job, lines[:18])
+            return
+        if lines is not None and not lines:
+            self.unfreeze()
+            self.info(self.ui["no_text"], "error")
+            return
         ocr_text = ocr.read_text(job["clean"]) if job.get("clean") is not None else None
         source = "Apple OCR + model" if ocr_text else "model"
         raw = self.vlm.ask_read(job["jpeg"], ocr_text or None)
@@ -580,6 +629,132 @@ class AirMind:
         tr = str(d.get("ar" if self.lang == "ar" else "en") or "")
         self.speak(tr[:160])
         self.context = {"kind": "ask", "jpeg": job["jpeg"], "history": [("Read this text.", raw)], "t": time.perf_counter()}
+
+    def _lens(self, job, lines):
+        """Paint the translation of every line right on top of it (like Google Lens)."""
+        d = parse_json(self.vlm.translate_lines([t for t, _ in lines]))
+        got = {}
+        for it in d.get("items") or []:
+            if isinstance(it, dict):
+                try:
+                    got[int(it.get("i", -1))] = it
+                except (TypeError, ValueError):
+                    pass
+        key = "ar" if self.lang == "ar" else "en"
+        rx, ry = job["origin"]
+        items = []
+        for i, (t, (x, y, w, h)) in enumerate(lines):
+            lv, _ = chinese.halal_check(t)
+            items.append((rx + x, ry + y, w, h, str(got.get(i, {}).get(key) or ""), lv if lv in ("haram", "doubtful") else None))
+        verdict, hits = chinese.halal_check("\n".join(t for t, _ in lines))
+        self.frozen, self.frozen_t = (job["clean"], (rx, ry)), time.perf_counter() - 1   # keep the text still under it
+        self.lens = {"items": items, "verdict": verdict, "hits": hits, "origin": (rx, ry)}
+        self.card = None
+        self.thinking = False
+        print("lens:", [(t, it[4]) for (t, _), it in zip(lines, items)], flush=True)
+        if verdict:
+            self.speak(self.ui[verdict])
+
+    # ---- 6) air calligraphy -----------------------------------------------------------
+    def _hanzi_worker(self, job):
+        strokes = job["strokes"]
+        img = hanzi.strokes_image(strokes)
+        d = parse_json(self.vlm.read_hanzi(cv2.imencode(".jpg", img)[1].tobytes()))
+        cands = [c for c in d.get("candidates") or [] if isinstance(c, dict) and chinese.has_han(str(c.get("text", "")))]
+        if not cands:
+            raise ValueError("couldn't read it: write bigger and slower")
+        best = next((c for c in cands if chinese.lookup(chinese.han_only(c["text"]))), cands[0])
+        char = chinese.han_only(best["text"])
+        alts = [char] + [chinese.han_only(c["text"]) for c in cands if chinese.han_only(c["text"]) != char]
+        font = self.text.paths.get("cjk")
+        score = hanzi.similarity(strokes, char, font) if font else None
+        mine = hanzi.strokes_thumb(strokes)
+        ref = hanzi.char_image(char, font) if font else mine
+        en = chinese.english(char) or str(best.get("en") or "")
+        ar = str(best.get("ar") or "")
+        self.card = ui.render_hanzi_card(self.text, char, alts, score, mine, ref, ar, en)
+        self.card_t, self.card_corner, self.card_life = time.perf_counter(), True, 14.0
+        self.card_left = True
+        self.strokes = []
+        self.word = {"target": "zh", "word": char, "cands": [], "alts": []}
+        self.thinking = False
+        if self.vocab and chinese.lookup(char):
+            self.vocab.add(dict(word=char, lang="zh", pinyin=chinese.pinyin(char), en=en, ar=ar, verified=1,
+                                hsk=chinese.hsk_level(char)), cv2.imencode(".jpg", mine)[1].tobytes())
+            self._remember_word(char)
+        self.speak(char, voice=self.voices.get("zh"), rate=130)
+        self.speak(ar if self.lang == "ar" and ar else en.split(";")[0])
+
+    def _remember_word(self, w, replaced=None):
+        if replaced in self.session_words:
+            self.session_words.remove(replaced)
+        if w in self.session_words:
+            self.session_words.remove(w)
+        self.session_words.append(w)
+
+    # ---- 7) interpreter ------------------------------------------------------------------
+    def _interpret(self, job):
+        text, lang = job["text"], job["lang"] or "ar"
+        target = ("ar" if self.lang == "ar" else "en") if lang == "zh" else "zh"
+        print(f"interpret [{lang} -> {target}]: {text}", flush=True)
+        d = parse_json(self.vlm.interpret(text, target))
+        out = str(d.get("translation") or "").strip()
+        if not out:
+            raise ValueError("no translation in the reply")
+        py = chinese.sentence_pinyin(out) if target == "zh" else chinese.sentence_pinyin(text)
+        tag = {"ar": "AR", "en": "EN", "zh": "中文"}
+        self.card = ui.render_subtitle(self.text, text, out, py, f"{tag[lang]}  →  {tag[target]}")
+        self.card_t, self.card_corner, self.card_life = time.perf_counter(), False, 0
+        if target == "zh":
+            self.word = {"target": "zh", "word": out, "say": out, "cands": [], "alts": []}   # Y: practice saying it
+        self.thinking = False
+        self.speak(out, voice=self.voices.get(target), rate=150 if target == "zh" else None,
+                   on_done=lambda ok: self._relisten())
+
+    def _relisten(self):
+        if self.mode == "interpret" and self.interp_auto and not self.listener.active and not self.thinking:
+            time.sleep(0.3)
+            self.toggle_listen("interpret")
+
+    # ---- 8) a story with your words (karaoke) ------------------------------------------------
+    def make_story(self):
+        words = self.session_words[-3:]
+        if len(words) < 2 and self.vocab:
+            words = [r["word"] for r in self.vocab.all() if r["lang"] == "zh"][-3:]
+        if len(words) < 2:
+            self.info(self.ui["need_words"], "error")
+            return
+        if self.thinking or self.vlm is None:
+            return
+        self.thinking, self.card = True, None
+        threading.Thread(target=self._guard, args=(self._story_worker, {"words": words}), daemon=True).start()
+
+    def _story_worker(self, job):
+        d = parse_json(self.vlm.story(job["words"]))
+        sents = [x for x in d.get("sentences") or [] if isinstance(x, dict) and chinese.has_han(str(x.get("zh", "")))]
+        if not sents:
+            raise ValueError("no story in the reply")
+        self.story = {"title": str(d.get("title") or ""), "sentences": sents, "words": job["words"], "cur": 0}
+        self._story_card()
+        self.thinking = False
+        if self.muted:
+            self.story["cur"] = -1
+            self._story_card()
+            return
+        for k, sn in enumerate(sents):
+            self.speak(sn["zh"], voice=self.voices.get("zh"), rate=140, on_done=lambda ok, k=k: self._story_next(k))
+
+    def _story_card(self):
+        st = self.story
+        st["card"] = self.card = ui.render_story_card(self.text, st, st["cur"], self.lang)
+        self.card_t, self.card_corner, self.card_life = time.perf_counter(), False, 0
+
+    def _story_next(self, k):
+        st = self.story
+        if not st or self.card is not st.get("card"):
+            return                                  # something else is on screen now
+        st["cur"] = k + 1 if k + 1 < len(st["sentences"]) else -1
+        self._story_card()
 
     # ---- 5) the "find it" game ---------------------------------------------------
     def next_find(self):
@@ -815,6 +990,10 @@ class AirMind:
             chips.append("READ  读")
         if self.mode == "find":
             chips.append("FIND  找")
+        if self.mode == "write":
+            chips.append("WRITE  写")
+        if self.mode == "interpret":
+            chips.append("INTERPRET  翻译")
         if self.detector.enabled:
             chips.append("INSTANT" if self.detector.model else
                          f"INSTANT: {self.detector.error}" if self.detector.error else "INSTANT loading...")
@@ -823,11 +1002,25 @@ class AirMind:
         x = 20
         for ch in chips:
             lab = self.text.label(ch, 22, (255, 255, 255))
-            round_rect(out, x, 20, x + lab.shape[1] + 24, 62, 21, self.ink if ch.startswith(("LEARN", "READ", "FIND"))
+            round_rect(out, x, 20, x + lab.shape[1] + 24, 62, 21, self.ink if ch.startswith(("LEARN", "READ", "FIND", "WRITE", "INTERPRET"))
                        else (60, 60, 60), 0.9)
             blit(out, lab, x + 12, 26)
             x += lab.shape[1] + 34
+        if self.lens:
+            ui.draw_lens(out, self.text, self.lens["items"])
+            v = self.lens["verdict"]
+            if v:
+                msg = {"haram": "NOT HALAL: ", "doubtful": "CHECK: ", "halal": "清真 HALAL "}[v] + \
+                      "  ".join(f"{t} {m}" for t, m, lv in self.lens["hits"] if v != "haram" or lv == "haram")[:60]
+                lab = self.text.label(msg, 24, (255, 255, 255))
+                ox, oy = self.lens["origin"]
+                col = {"haram": (40, 40, 200), "doubtful": (20, 140, 230), "halal": (60, 150, 60)}[v]
+                round_rect(out, ox, max(0, oy - 44), ox + lab.shape[1] + 24, max(40, oy - 4), 14, col, 0.95)
+                blit(out, lab, ox + 12, max(2, oy - 42))
         for s in self.strokes:
+            if len(s) > 1 and self.mode == "write":
+                hanzi.brush(out, s, (60, 200, 255))
+                continue
             if len(s) > 1:
                 pts, closed = stroke_points(s)
                 cv2.polylines(out, [pts], closed, INK_SHADOW, 8, cv2.LINE_AA)
@@ -890,6 +1083,8 @@ class AirMind:
                 if W > H:
                     x = 28 if self.card_left else W - cw - 28
                     y = H - ch - 110
+            elif self.mode == "interpret":
+                y = H - ch - 30                                     # subtitles: bottom center
             elif W > H and (self.zone or self.mode):
                 x = 28 if self.card_left else W - cw - 28             # keep cards clear of the object / red box
             y = max(70, min(y, H - ch - 10))
@@ -1088,7 +1283,13 @@ def handle_key(app, k, frame, out, now):
     elif c == "c":
         app.clear()
     elif c == "v":
-        app.toggle_listen("ask")
+        app.toggle_listen("interpret" if app.mode == "interpret" else "ask")
+    elif c == "w":
+        app.toggle_mode("write")
+    elif c == "b":
+        app.toggle_mode("interpret")
+    elif c == "u":
+        app.make_story()
     elif c == "y":
         app.toggle_listen("practice")
     elif c == "t":
