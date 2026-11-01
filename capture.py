@@ -24,6 +24,25 @@ def sharpness(bgr):
     return float(cv2.Laplacian(g, cv2.CV_64F).var())
 
 
+def brightness(bgr):
+    g = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    return float(g[::4, ::4].mean())
+
+
+def enhance(bgr):
+    """Dark room: lift the shadows (CLAHE on lightness + gamma) so the small model can actually see."""
+    b = brightness(bgr)
+    if b >= 95:
+        return bgr
+    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
+    l, a, bb = cv2.split(lab)
+    l = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)).apply(l)
+    out = cv2.cvtColor(cv2.merge([l, a, bb]), cv2.COLOR_LAB2BGR)
+    gamma = 0.6 if b < 50 else 0.8
+    lut = (np.linspace(0, 1, 256) ** gamma * 255).astype(np.uint8)
+    return cv2.LUT(out, lut)
+
+
 class FrameBuffer:
     def __init__(self, seconds=0.6, size=14):
         self.seconds, self.frames = seconds, deque(maxlen=size)

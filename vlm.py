@@ -99,7 +99,10 @@ Identify the object and give its everyday name in {lang} ({rule}).
 Give up to 3 candidates, best first, each with a confidence from 0 to 1 that is honest: if the object is unclear,
 the confidences must be low. Use the most common everyday word a native speaker would say, not a rare or
 technical term.
-"example" is a very short, simple sentence in {lang} using the FIRST candidate (beginner level).
+If there is no clear object (only a wall, a hand, darkness, a blurry picture), still answer but give every
+candidate a confidence below 0.3.
+"example" is a short, simple sentence (at least 4 words) in {lang} using the FIRST candidate (beginner level),
+not just the word itself.
 "example_tr" is its translation into {tr}."""
 LEARN_RULE = {"zh": "simplified characters only, no pinyin", "en": "a single common English noun"}
 LEARN_SCHEMA = {"type": "object", "properties": {

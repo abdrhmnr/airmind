@@ -45,7 +45,7 @@ import hanzi
 import ocr
 import ui
 from audio import Listener, SpeechToText
-from capture import AutoCapture, FrameBuffer
+from capture import AutoCapture, FrameBuffer, brightness, enhance
 from detector import InstantDetector
 from hands import OneEuro, pick_hands, read_hand, snap_shape, stroke_points
 from tracker import StickerBoard
@@ -85,7 +85,9 @@ UI = {
            "halal": "عليها علامة حلال", "right": "صح", "wrong": "لا، دي",
            "write_first": "اكتب حرف صيني في الهوا الأول (لِم صوابعك وارسم)، وبعدين لايك",
            "need_words": "اتعلم كلمتين على الأقل الأول (T وبعدين اعمل دايرة حوالين حاجتين)",
-           "no_text": "مش لاقي كلام مكتوب. قرّب الورقة وخليها مستوية"},
+           "no_text": "مش لاقي كلام مكتوب. قرّب الورقة وخليها مستوية",
+           "not_sure": "مش شايف حاجة واضحة. امسك الحاجة قريب ونوّر الأوضة",
+           "not_sure_say": "مش متأكد، قرّب الحاجة ونوّر", "dark": "الأوضة ضلمة: نوّر"},
     "en": {"thinking": "thinking", "hint": "pinch to draw   •   thumbs up = ask   •   fist = clear",
            "ask": "ASK", "clear": "CLEAR", "listen": "TALK", "answer": "The answer is",
            "no_server": "Start Ollama or LM Studio first",
@@ -97,7 +99,9 @@ UI = {
            "halal": "It has a halal mark", "right": "Right", "wrong": "No, that's",
            "write_first": "Write a Chinese character in the air first (pinch and draw), then thumbs up",
            "need_words": "Learn at least two words first (T, then circle two things)",
-           "no_text": "I can't find any text. Hold it closer and flat"},
+           "no_text": "I can't find any text. Hold it closer and flat",
+           "not_sure": "I can't see anything clear. Hold the object close, with more light",
+           "not_sure_say": "Not sure. Bring it closer, with more light", "dark": "Too dark: turn on a light"},
 }
 
 
@@ -419,6 +423,8 @@ class AirMind:
         # the sharpest of the last ~0.5 s of frames: the latest one is often blurred by the thumbs-up
         sharp, _ = self.frames.best((rx, ry, rw, rh))
         base = sharp if sharp is not None else frame
+        base = base.copy()
+        base[ry:ry + rh, rx:rx + rw] = enhance(base[ry:ry + rh, rx:rx + rw])   # dark room -> brighter picture
         clean = base[ry:ry + rh, rx:rx + rw].copy()
         marked = base.copy()
         for s in strokes:
@@ -501,6 +507,16 @@ class AirMind:
             cands = [best] + [c for c in cands if c is not best]
         info = self._make_word(cands[0], target, ex, ex_tr, cands)
         info["first_example"] = (ex, ex_tr, first)
+        top = max(c["confidence"] for c in cands)
+        print(f"learn: {[(c['word'], round(c['confidence'], 2)) for c in cands]}", flush=True)
+        if top < 0.35:                      # the model is guessing: say so instead of teaching a wrong word
+            self.word = info                # 1/2/3 can still accept one of the guesses
+            self.unfreeze()
+            guesses = " / ".join(c["word"] for c in cands)
+            self.info(f"{self.ui['not_sure']}  ({guesses})   1/2/3", "error")
+            self.card_corner, self.card_life = True, 8.0
+            self.speak(self.ui["not_sure_say"])
+            return
         self._show_word(info, job, new=True)
 
     def _make_word(self, cand, target, ex, ex_tr, cands):
@@ -515,7 +531,7 @@ class AirMind:
             mp = chinese.measure_phrase(w, v["measure"])
             if mp:
                 info["measure_phrase"], info["measure_py"] = mp
-            if ex and w in ex:                                    # the example must use THIS word
+            if ex and w in ex and len(chinese.han_only(ex)) > len(w) + 1:   # a real sentence that uses THIS word
                 info.update(example=ex, example_py=chinese.sentence_pinyin(ex), example_tr=ex_tr)
         else:
             if ex and w.lower() in ex.lower():
@@ -935,8 +951,11 @@ class AirMind:
         self.board.update(frame)
         self.tick_find(now)
         self.tick_instant(frame, now)
+        if self.zone and self.frames.frames and len(self.frames.frames) % 7 == 0:
+            zx, zy, zw, zh = self.zone_rect()
+            self.dark = brightness(frame[zy:zy + zh, zx:zx + zw]) < 45
         if self.auto.enabled and self.zone:
-            busy = self.thinking or self.listener.active or (self.card is not None and now - self.card_t < 2.0
+            busy = getattr(self, "dark", False) or self.thinking or self.listener.active or (self.card is not None and now - self.card_t < 2.0
                                                              and not self.card_corner and self.mode != "find")
             if self.auto.update(frame, self.zone_rect(), self.hand_centers, busy):
                 self.ask(frame, auto=True)
@@ -976,6 +995,10 @@ class AirMind:
             tag = self.text.label(tag_txt, 22, (255, 255, 255))
             round_rect(out, zx, max(0, zy - 38), zx + tag.shape[1] + 24, max(34, zy - 4), 12, red, 0.95)
             blit(out, tag, zx + 12, max(2, zy - 36))
+            if getattr(self, "dark", False):
+                warn = self.text.label("LOW LIGHT  ·  " + self.ui["dark"], 22, (255, 255, 255))
+                round_rect(out, zx, zy + zh + 8, zx + warn.shape[1] + 24, zy + zh + 44, 12, (20, 120, 210), 0.95)
+                blit(out, warn, zx + 12, zy + zh + 10)
             if self.auto.progress > 0:                          # "hold still..." ring
                 c = (zx + zw // 2, zy + zh // 2)
                 cv2.ellipse(out, c, (46, 46), -90, 0, 360, (60, 60, 60), 6, cv2.LINE_AA)
@@ -1225,7 +1248,12 @@ def run(app, cam_index, prefer_hand="right"):
         res = hands.detect_for_video(mp.Image(image_format=mp.ImageFormat.SRGB,
                                               data=cv2.cvtColor(view, cv2.COLOR_BGR2RGB)), ts)
         hand, other = pick_hands(res, app.band, prefer_hand, app.cursor)
-        app.hand_centers = [h[[0, 5, 9, 13, 17]].mean(axis=0) for h in (hand, other) if h is not None]
+        app.hand_centers = []                       # hands that hold something (a thumbs-up or open hand doesn't count)
+        for h in (hand, other):
+            if h is not None:
+                g = read_hand(h)
+                if not (g["thumbs_up"] or g["open_palm"] or g["pointing"]):
+                    app.hand_centers.append(g["center"])
         ev = app.update_hand(hand, dt, other)
         app.tick(frame, now)
         hold_at = None
