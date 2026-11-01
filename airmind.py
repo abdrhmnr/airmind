@@ -455,7 +455,7 @@ class AirMind:
         raw = self.vlm.ask_learn(job["jpeg"], job["has_strokes"], target, job["focus"])
         cands, ex, ex_tr = parse_learn(raw)
         if not cands:
-            raise ValueError("no word in the reply")
+            raise ValueError("the model didn't name anything. Hold it closer / more light, then try again")
         first = cands[0]["word"]                                  # the example sentence was written for this one
         if target == "zh":
             best = chinese.best_candidate(cands) or cands[0]      # first candidate that is a real dictionary word
@@ -797,7 +797,7 @@ class AirMind:
             red = (40, 40, 235)
             cv2.rectangle(out, (zx, zy), (zx + zw, zy + zh), (20, 20, 20), 7, cv2.LINE_AA)
             cv2.rectangle(out, (zx, zy), (zx + zw, zy + zh), red, 4, cv2.LINE_AA)
-            tag_txt = ("ASK ZONE" if self.lang == "en" else "حط الحاجة هنا") + ("  ·  AUTO" if self.auto.enabled else "")
+            tag_txt = "ASK ZONE" + ("  ·  AUTO" if self.auto.enabled else "")
             tag = self.text.label(tag_txt, 22, (255, 255, 255))
             round_rect(out, zx, max(0, zy - 38), zx + tag.shape[1] + 24, max(34, zy - 4), 12, red, 0.95)
             blit(out, tag, zx + 12, max(2, zy - 36))

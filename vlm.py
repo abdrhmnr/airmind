@@ -104,6 +104,10 @@ LEARN_SCHEMA = {"type": "object", "properties": {
     "example": {"type": "string"}, "example_tr": {"type": "string"}},
     "required": ["candidates", "example", "example_tr"]}
 
+LEARN_EXAMPLE = {"candidates": [{"word": "杯子", "en": "cup", "ar": "كوباية", "confidence": 0.9},
+                                {"word": "茶杯", "en": "teacup", "ar": "فنجان", "confidence": 0.3}],
+                 "example": "这是我的杯子。", "example_tr": "This is my cup."}
+
 TUTOR_SYSTEM = """You are a patient Mandarin Chinese tutor that sees through a webcam. The learner is a beginner
 (HSK 1-3) living in China. They ask you something out loud (in Arabic, English or Chinese) about what the camera
 shows, e.g. "how do I say I want to buy this?".
@@ -172,7 +176,15 @@ class LocalVLM:
                       "This is a close-up of the object I'm holding up. Teach me its word (ignore hands and fingers).")
         else:
             prompt = "Teach me the word for what I circled." if has_strokes else "Teach me the word for the main object you see."
-        return self.chat(learn_system(target), prompt, jpeg, LEARN_SCHEMA, temperature=0.2, max_tokens=320)
+        raw = self.chat(learn_system(target), prompt, jpeg, LEARN_SCHEMA, temperature=0.2, max_tokens=500)
+        if parse_learn(raw)[0]:
+            return raw
+        print(f"[model] no word in: {raw[:300]!r}  -> asking again", flush=True)
+        retry = self.chat(learn_system(target) + "\nReply with JSON only, like: " + json.dumps(LEARN_EXAMPLE, ensure_ascii=False),
+                          prompt, jpeg, None, temperature=0.3, max_tokens=800)
+        if not parse_learn(retry)[0]:
+            print(f"[model] still no word in: {retry[:300]!r}", flush=True)
+        return retry
 
     def ask_tutor(self, jpeg, question, context_word=None, history=None):
         ctx = f' (we were just talking about "{context_word}")' if context_word else ""
@@ -205,18 +217,24 @@ class LocalVLM:
                 msgs.append(m)
                 if a is not None:
                     msgs.append({"role": "assistant", "content": a})
-            body = {"model": self.model, "stream": False, "keep_alive": "30m",
+            body = {"model": self.model, "stream": False, "keep_alive": "30m", "think": False,
                     "options": {"temperature": temperature, "num_predict": max_tokens}, "messages": msgs,
                     "format": schema if (schema and self.schema_ok) else "json"}
             try:
                 r = http_json(f"{self.url}/api/chat", body, timeout=120)
             except urllib.error.HTTPError as e:
-                if not (schema and self.schema_ok and e.code in (400, 500)):
+                if e.code not in (400, 500):
                     raise
-                self.schema_ok = False                        # old Ollama: plain JSON mode
+                self.schema_ok = False                        # old Ollama: plain JSON mode, no "think" switch
                 body["format"] = "json"
+                body.pop("think", None)
                 r = http_json(f"{self.url}/api/chat", body, timeout=120)
-            return r["message"]["content"]
+            content = (r.get("message") or {}).get("content") or ""
+            if not content.strip():
+                # thinking models (qwen3-vl) can spend every token on "thinking" and return an empty answer
+                print(f"[model] empty answer (done_reason={r.get('done_reason')}, "
+                      f"thinking={len((r.get('message') or {}).get('thinking') or '')} chars)", flush=True)
+            return content
 
         msgs = [{"role": "system", "content": system}]
         turns = list(history or []) + [(prompt, None)]
@@ -261,8 +279,14 @@ def parse_reply(raw):
 
 def parse_learn(raw):
     """-> (candidates [{word,en,ar,confidence}], example, example_tr). Also accepts the old one-word shape."""
-    d = parse_json(raw)
-    cands = d.get("candidates")
+    d = {} if (raw or "").strip().startswith("[") else parse_json(raw)
+    if not d:
+        m = re.search(r"\[.*\]", raw or "", re.S)               # a bare list of candidates
+        try:
+            d = {"candidates": json.loads(m.group(0))} if m else {}
+        except json.JSONDecodeError:
+            d = {}
+    cands = d.get("candidates") or d.get("words") or d.get("options")
     if not isinstance(cands, list):
         cands = [{"word": d.get("word", ""), "en": d.get("en", ""), "ar": d.get("ar", ""), "confidence": 0.5}] \
             if d.get("word") else []
